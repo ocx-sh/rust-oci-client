@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// A token granted during the OAuth2-like workflow for OCI registries.
 #[derive(Deserialize, Clone)]
@@ -186,7 +186,7 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
             Some(token_exp)
         }
         Err(error) => {
-            warn!(?error, "Invalid bearer token");
+            debug!(?error, "Invalid bearer token");
             None
         }
     }
