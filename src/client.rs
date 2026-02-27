@@ -88,6 +88,13 @@ pub struct TagResponse {
     pub tags: Vec<String>,
 }
 
+/// The data returned by a successful catalog Request
+#[derive(Deserialize, Debug)]
+pub struct CatalogResponse {
+    /// List of available repositories in the registry
+    pub repositories: Vec<String>,
+}
+
 /// Layer descriptor required to pull a layer
 pub struct LayerDescriptor<'a> {
     /// The digest of the layer
@@ -1599,7 +1606,6 @@ impl Client {
         debug!("Pulling referrers from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
             .into_request_builder()
@@ -1613,6 +1619,54 @@ impl Client {
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
 
         Ok(manifest)
+    }
+
+    /// List a set of available repositories in the local registry cluster
+    pub async fn catalog(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+        n : Option<usize>,
+        last : Option<&str>
+    ) -> Result<Vec<String>> {
+        let op = RegistryOperation::Pull;
+        let url = format!(
+            "{scheme}://{registry}/v2/_catalog",
+            scheme = self.config.protocol.scheme_for(image.registry()),
+            registry = image.registry()
+        );
+        
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        let request = self.client.get(&url);
+        let request = if let Some(num) = n {
+            request.query(&[("n", num)])
+        } else {
+            request
+        };
+        let request = if let Some(l) = last {
+            request.query(&[("last", l)])
+        } else {
+            request
+        };
+        let request = RequestBuilderWrapper {
+            client: self,
+            request_builder: request
+        };
+        let res = request
+            .apply_auth(image, op)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        let status = res.status();
+        let body = res.bytes().await?;
+
+        validate_registry_response(status, &body, &url)?;
+
+        let catalog: CatalogResponse = serde_json::from_slice(&body)?;
+        Ok(catalog.repositories)
     }
 
     async fn extract_location_header(
