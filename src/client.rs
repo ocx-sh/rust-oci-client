@@ -44,7 +44,8 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     OCI_IMAGE_INDEX_MEDIA_TYPE,
 ];
 
-const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
+/// Default value for `ClientConfig::push_chunk_size`.
+pub const DEFAULT_PUSH_CHUNK_SIZE: usize = 4096 * 1024;
 
 /// Default value for `ClientConfig::max_concurrent_upload`
 pub const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
@@ -289,7 +290,7 @@ impl Default for Client {
             auth_store: Arc::default(),
             tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
             client: reqwest::Client::default(),
-            push_chunk_size: PUSH_CHUNK_MAX_SIZE,
+            push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
         }
     }
 }
@@ -357,11 +358,12 @@ impl TryFrom<ClientConfig> for Client {
         }
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
+        let push_chunk_size = config.push_chunk_size;
         Ok(Self {
             config: Arc::new(config),
             tokens: TokenCache::new(default_token_expiration_secs),
             client: client_builder.build()?,
-            push_chunk_size: PUSH_CHUNK_MAX_SIZE,
+            push_chunk_size,
             ..Default::default()
         })
     }
@@ -371,12 +373,13 @@ impl Client {
     /// Create a new client with the supplied config
     pub fn new(config: ClientConfig) -> Self {
         let default_token_expiration_secs = config.default_token_expiration_secs;
+        let push_chunk_size = config.push_chunk_size;
         Client::try_from(config).unwrap_or_else(|err| {
             warn!("Cannot create OCI client from config: {:?}", err);
             warn!("Creating client with default configuration");
             Self {
                 tokens: TokenCache::new(default_token_expiration_secs),
-                push_chunk_size: PUSH_CHUNK_MAX_SIZE,
+                push_chunk_size,
                 ..Default::default()
             }
         })
@@ -2058,6 +2061,11 @@ pub struct ClientConfig {
     /// during an image pull.
     pub platform_resolver: Option<Box<PlatformResolverFn>>,
 
+    /// Maximum chunk size in bytes used to perform a `push` operation.
+    ///
+    /// This defaults to [`DEFAULT_PUSH_CHUNK_SIZE`].
+    pub push_chunk_size: usize,
+
     /// Maximum number of concurrent uploads to perform during a `push`
     /// operation.
     ///
@@ -2118,6 +2126,7 @@ impl Default for ClientConfig {
             tls_certs_only: Vec::new(),
             extra_root_certificates: Vec::new(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
+            push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
             max_concurrent_download: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
             default_token_expiration_secs: DEFAULT_TOKEN_EXPIRATION_SECS,
