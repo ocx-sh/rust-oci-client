@@ -541,6 +541,59 @@ impl Client {
 
     /// Checks if a blob exists in the remote registry
     pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
+        match self.head_blob_response(image, digest).await? {
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    /// Fetches the size of a blob in the remote registry without
+    /// downloading its body.
+    ///
+    /// Issues an HTTP HEAD against the blob URL and returns the
+    /// `Content-Length` header value. Returns `Ok(None)` when the
+    /// registry reports the blob as missing (404). Returns an error
+    /// when the registry responds with a success status but omits
+    /// `Content-Length` — callers rely on a known size to build a
+    /// valid OCI descriptor, and silently falling back to zero would
+    /// corrupt the manifest.
+    pub async fn fetch_blob_size(
+        &self,
+        image: &Reference,
+        digest: &str,
+    ) -> Result<Option<u64>> {
+        let Some(res) = self.head_blob_response(image, digest).await? else {
+            return Ok(None);
+        };
+        let header = res
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .ok_or_else(|| {
+                OciDistributionError::GenericError(Some(
+                    "registry HEAD response did not include Content-Length".to_string(),
+                ))
+            })?;
+        let header_str = header.to_str().map_err(|e| {
+            OciDistributionError::GenericError(Some(format!(
+                "invalid Content-Length header: {e}"
+            )))
+        })?;
+        let content_length = header_str.parse::<u64>().map_err(|e| {
+            OciDistributionError::GenericError(Some(format!(
+                "non-numeric Content-Length header: {e}"
+            )))
+        })?;
+        Ok(Some(content_length))
+    }
+
+    /// Internal helper: issue a HEAD against the blob URL and return
+    /// the raw response when the blob exists, `None` on 404, or an
+    /// error on any other non-success status.
+    async fn head_blob_response(
+        &self,
+        image: &Reference,
+        digest: &str,
+    ) -> Result<Option<Response>> {
         let url = self.to_v2_blob_url(image, digest);
         let request = RequestBuilderWrapper {
             client: self,
@@ -554,11 +607,11 @@ impl Client {
             .send()
             .await?;
 
-        match res.error_for_status() {
-            Ok(_) => Ok(true),
+        match res.error_for_status_ref() {
+            Ok(_) => Ok(Some(res)),
             Err(err) => {
                 if err.status() == Some(StatusCode::NOT_FOUND) {
-                    Ok(false)
+                    Ok(None)
                 } else {
                     Err(err.into())
                 }
@@ -4069,6 +4122,53 @@ mod test {
             .blob_exists(&reference, EMPTY_JSON_DIGEST)
             .await
             .expect("failed to check blob existence"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_fetch_blob_size() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            ..Default::default()
+        });
+
+        let reference = Reference::try_from(format!("localhost:{server_port}/empty"))
+            .expect("failed to parse reference");
+
+        // Absent blob must report None, not an error.
+        let missing = client
+            .fetch_blob_size(&reference, EMPTY_JSON_DIGEST)
+            .await
+            .expect("fetch_blob_size should not error on a missing blob");
+        assert_eq!(
+            missing, None,
+            "fetch_blob_size must return None for a blob the registry does not have"
+        );
+
+        // After upload, HEAD + Content-Length must round-trip the byte length.
+        client
+            .push_blob(&reference, EMPTY_JSON_BLOB.as_bytes(), EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to push empty json blob");
+        let present = client
+            .fetch_blob_size(&reference, EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to fetch blob size after push");
+        assert_eq!(
+            present,
+            Some(EMPTY_JSON_BLOB.len() as u64),
+            "fetch_blob_size must report the pushed blob's length, not zero or the wrong figure"
+        );
     }
 
     #[rstest]
