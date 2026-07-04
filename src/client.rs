@@ -2,8 +2,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::hash::Hash;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -16,8 +17,9 @@ use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
 use serde::{Deserialize, Deserializer, Serialize};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::RwLock;
+use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, trace, warn};
 
 pub use crate::blob::*;
@@ -781,6 +783,32 @@ impl Client {
             let location = self.begin_push_monolithical_session(image).await?;
             return self
                 .push_stream_monolithically(&location, image, blob_data_stream, size, blob_digest)
+                .await;
+        }
+
+        // When the total size is known, stream each PATCH body directly from the
+        // input stream (bounded to `push_chunk_size`) rather than buffering the whole
+        // chunk in memory. reqwest pulls from each body only as the socket accepts
+        // more (backpressure), so a progress wrapper the caller layered onto
+        // `blob_data_stream` advances as bytes are pulled for the wire — while every
+        // request body stays bounded for registries / proxies that cap single-request
+        // body size. Falls back to the buffered chunked path below when size is None.
+        if let Some(total) = size {
+            let mut location = self.begin_push_chunked_session(image).await?;
+            let mapped = blob_data_stream.map(|frame| frame.map_err(std::io::Error::other));
+            let shared = SharedReader::new(StreamReader::new(mapped));
+            let mut range_start = 0;
+            let mut remaining = total;
+            while remaining > 0 {
+                let chunk_len = self.push_chunk_size.min(remaining);
+                let body = ReaderStream::new(shared.clone().take(chunk_len as u64));
+                (location, range_start) = self
+                    .push_chunk_streamed(&location, image, body, range_start, chunk_len)
+                    .await?;
+                remaining -= chunk_len;
+            }
+            return self
+                .end_push_chunked_session(&location, image, blob_digest)
                 .await;
         }
 
@@ -1693,7 +1721,51 @@ impl Client {
             .await
     }
 
-    /// Pushes a single chunk of a blob to a registry, as part of a chunked blob upload.
+    /// Sends one chunk `PATCH` with `Content-Range` and an explicit
+    /// `Content-Length` of `chunk_len` bytes.
+    ///
+    /// Shared by [`push_chunk`] (buffered `Bytes` body) and
+    /// [`push_chunk_streamed`] (streamed body) — the single source of truth for the
+    /// chunk-upload request contract. Returns the location for the next chunk
+    /// alongside the next range start.
+    async fn push_chunk_body(
+        &self,
+        location: &str,
+        image: &Reference,
+        body: reqwest::Body,
+        range_start: usize,
+        chunk_len: usize,
+    ) -> Result<(String, usize)> {
+        let end_range_inclusive = range_start + chunk_len - 1;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Range",
+            format!("{range_start}-{end_range_inclusive}").parse().unwrap(),
+        );
+        headers.insert("Content-Length", format!("{chunk_len}").parse().unwrap());
+        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+
+        debug!(?range_start, ?end_range_inclusive, chunk_len, ?location, "Pushing chunk");
+
+        let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
+            .into_request_builder()
+            .headers(headers)
+            .body(body)
+            .send()
+            .await?;
+
+        // Returns location for next chunk and the start byte for the next range
+        Ok((
+            self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
+                .await?,
+            end_range_inclusive + 1,
+        ))
+    }
+
+    /// Pushes a single buffered chunk of a blob, as part of a chunked blob upload.
     /// The caller is responsible for chunking the blob data into smaller parts, if needed.
     ///
     /// Returns the URL location for the next chunk, alongside the start of the next range to upload.
@@ -1706,46 +1778,43 @@ impl Client {
     ) -> Result<(String, usize)> {
         if blob_chunk.is_empty() {
             return Err(OciDistributionError::PushNoDataError);
-        };
+        }
+        let chunk_len = blob_chunk.len();
+        self.push_chunk_body(location, image, blob_chunk.into(), range_start, chunk_len)
+            .await
+    }
 
-        let chunk_size = blob_chunk.len();
-        let end_range_inclusive = range_start + chunk_size - 1;
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Content-Range",
-            format!("{range_start}-{end_range_inclusive}")
-                .parse()
-                .unwrap(),
-        );
-
-        headers.insert("Content-Length", format!("{chunk_size}").parse().unwrap());
-        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-
-        debug!(
-            ?range_start,
-            ?end_range_inclusive,
-            chunk_size,
-            ?location,
-            ?headers,
-            "Pushing chunk"
-        );
-
-        let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
-            .into_request_builder()
-            .headers(headers)
-            .body(blob_chunk)
-            .send()
-            .await?;
-
-        // Returns location for next chunk and the start byte for the next range
-        Ok((
-            self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
-                .await?,
-            end_range_inclusive + 1,
-        ))
+    /// Pushes a single chunk whose body is streamed rather than buffered.
+    ///
+    /// Identical wire behavior to [`push_chunk`] — one `PATCH` with `Content-Range`
+    /// and an explicit `Content-Length` of `chunk_len` — but the body is a
+    /// [`Stream`] drained by reqwest under socket backpressure. `chunk_len` must
+    /// equal the number of bytes `body` will yield (the caller derives it from the
+    /// known total size), so the registry receives an exact `Content-Length`.
+    ///
+    /// Returns the location for the next chunk alongside the next range start.
+    async fn push_chunk_streamed<S>(
+        &self,
+        location: &str,
+        image: &Reference,
+        body: S,
+        range_start: usize,
+        chunk_len: usize,
+    ) -> Result<(String, usize)>
+    where
+        S: Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+    {
+        if chunk_len == 0 {
+            return Err(OciDistributionError::PushNoDataError);
+        }
+        self.push_chunk_body(
+            location,
+            image,
+            reqwest::Body::wrap_stream(body),
+            range_start,
+            chunk_len,
+        )
+        .await
     }
 
     /// Mounts a blob to the provided reference, from the given source
@@ -2270,6 +2339,39 @@ async fn stream_from_response(
         digest_header_value: header_digest,
         stream,
     })
+}
+
+/// A cheaply-clonable handle to one shared, pinned [`AsyncRead`].
+///
+/// Consecutive chunk bodies in a streamed chunked push must each be an owned,
+/// `'static` request body, yet resume reading exactly where the previous chunk
+/// stopped. Each chunk gets a `SharedReader` clone (an `Arc` bump) wrapped in
+/// [`AsyncReadExt::take`] so it reads at most `chunk_len` bytes from the one
+/// underlying reader. Chunks are streamed strictly one at a time, so the mutex is
+/// never actually contended; it exists only to satisfy `Send + 'static` on the
+/// request body. The guard is held only across a single non-`async` `poll_read`,
+/// never across an `.await`.
+#[derive(Clone)]
+struct SharedReader(Arc<std::sync::Mutex<Pin<Box<dyn AsyncRead + Send>>>>);
+
+impl SharedReader {
+    fn new<R: AsyncRead + Send + 'static>(reader: R) -> Self {
+        SharedReader(Arc::new(std::sync::Mutex::new(Box::pin(reader))))
+    }
+}
+
+impl AsyncRead for SharedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Recover from a poisoned lock rather than panic across the `AsyncRead`
+        // boundary: poisoning means a wrapped reader panicked mid-poll, but the
+        // reader value itself is intact, so continue with it.
+        let mut reader = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        reader.as_mut().poll_read(cx, buf)
+    }
 }
 
 /// The request builder wrapper allows to be instantiated from a
