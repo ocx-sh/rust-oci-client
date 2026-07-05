@@ -382,6 +382,16 @@ impl TryFrom<ClientConfig> for Client {
     }
 }
 
+/// Outcome of [`Client::mount_blob`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobMountResponse {
+    /// 201 - blob mounted into the target repository.
+    Mounted,
+    /// 202 - registry declined the mount and opened a regular upload session
+    /// at the returned location (spec-conforming miss); caller must upload.
+    UploadSessionOpened(String),
+}
+
 impl Client {
     /// Create a new client with the supplied config
     pub fn new(config: ClientConfig) -> Self {
@@ -1823,7 +1833,7 @@ impl Client {
         image: &Reference,
         source: &Reference,
         digest: &str,
-    ) -> Result<()> {
+    ) -> Result<BlobMountResponse> {
         let base_url = self.to_v2_blob_upload_url(image);
         let url = Url::parse_with_params(
             &base_url,
@@ -1838,10 +1848,23 @@ impl Client {
             .send()
             .await?;
 
+        // A spec-conforming registry either mounts the blob (201) or, on a miss,
+        // declines and opens a regular upload session (202) at the returned
+        // Location instead of erroring - the caller uploads there. Any other
+        // status still routes through extract_location_header's existing
+        // SpecViolationError / ServerError mapping (checked against CREATED,
+        // matching prior behavior).
+        if res.status() == reqwest::StatusCode::ACCEPTED {
+            let location = self
+                .extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
+                .await?;
+            return Ok(BlobMountResponse::UploadSessionOpened(location));
+        }
+
         self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
             .await?;
 
-        Ok(())
+        Ok(BlobMountResponse::Mounted)
     }
 
     /// Pushes the manifest for a specified image
@@ -3975,9 +3998,11 @@ mod test {
         let image_reference: Reference = format!("localhost:{port}/image-repository")
             .parse()
             .unwrap();
-        c.mount_blob(&image_reference, &layer_reference, &layer.digest)
+        let response = c
+            .mount_blob(&image_reference, &layer_reference, &layer.digest)
             .await
             .expect("Failed to mount");
+        assert_eq!(response, BlobMountResponse::Mounted);
 
         // Pull the layer from `image-repository`
         let mut buf = Vec::new();
@@ -3985,6 +4010,66 @@ mod test {
             .await
             .expect("Failed to pull");
 
+        assert_eq!(layer_data, buf);
+    }
+
+    /// A mount for a digest absent from the source repository is a
+    /// spec-legal miss: the registry opens a regular upload session (202)
+    /// instead of erroring. A normal `push_blob` against the same digest
+    /// must still land the blob afterward.
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_mount_miss_opens_upload_session() {
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let c = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+            ..Default::default()
+        });
+
+        // `source-repository` never receives this blob, so the digest is
+        // absent from it - the mount attempt is guaranteed to miss.
+        let source_reference: Reference = format!("localhost:{port}/source-repository")
+            .parse()
+            .unwrap();
+        let layer_data = vec![5u8, 6, 7, 8];
+        let layer = OciDescriptor {
+            digest: sha256_digest(&layer_data),
+            ..Default::default()
+        };
+
+        let image_reference: Reference = format!("localhost:{port}/image-repository-miss")
+            .parse()
+            .unwrap();
+        let response = c
+            .mount_blob(&image_reference, &source_reference, &layer.digest)
+            .await
+            .expect("mount miss must not error");
+        assert!(
+            matches!(response, BlobMountResponse::UploadSessionOpened(_)),
+            "expected UploadSessionOpened, got {response:?}"
+        );
+
+        // A normal push_blob still lands the blob despite the prior mount miss.
+        c.push_blob(
+            &image_reference,
+            Bytes::copy_from_slice(&layer_data),
+            &layer.digest,
+        )
+        .await
+        .expect("push_blob must still succeed after a mount miss");
+
+        let mut buf = Vec::new();
+        c.pull_blob(&image_reference, &layer, &mut buf)
+            .await
+            .expect("Failed to pull");
         assert_eq!(layer_data, buf);
     }
 
