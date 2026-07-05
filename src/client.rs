@@ -952,9 +952,20 @@ impl Client {
                 debug!("Successfully authorized for image '{:?}'", image);
                 Ok(Some(RegistryTokenType::Bearer(token)))
             }
-            _ => {
+            status => {
                 let reason = auth_res.text().await?;
                 debug!("Failed to authenticate for image '{:?}': {}", image, reason);
+                // A token-service outage (5xx) or rate-limit (429) is an
+                // availability failure, not a credential rejection. Preserve the
+                // status via ServerError so callers can classify it apart from a
+                // genuine 401/403 (which stays AuthenticationFailure).
+                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(OciDistributionError::ServerError {
+                        code: status.as_u16(),
+                        url: realm.to_string(),
+                        message: reason,
+                    });
+                }
                 Err(OciDistributionError::AuthenticationFailure(reason))
             }
         }
