@@ -57,6 +57,11 @@ tokio = { version = "1", features = ["macros", "io-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = { version = "0.1", features = ['log'] }
 unicase = "2.8"
+# Mozilla CA roots compiled into the binary so the default client is
+# self-contained on hosts with no system trust store (minimal/distroless
+# container, CI runner without ca-certificates). Seeded into
+# `ClientConfig::default().extra_root_certificates`.
+webpki-root-certs = "1"
 
 [dev-dependencies]
 assert-json-diff = "2.0"

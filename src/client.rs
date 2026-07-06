@@ -2631,6 +2631,28 @@ pub struct ClientConfig {
     pub no_proxy: Option<String>,
 }
 
+/// Mozilla's CA root set, compiled into the binary and DER-encoded.
+///
+/// Seeded into every `ClientConfig::default().extra_root_certificates` so the
+/// client is self-contained on a host with no system trust store. Under
+/// reqwest 0.13 the `rustls` path delegates trust to `rustls-platform-verifier`,
+/// which — with an *empty* root set — loads roots only from the system store and
+/// hard-errors (`No CA certificates were loaded from the system`) when that store
+/// is empty. `Client::new` then "falls back" to `reqwest::Client::default()`,
+/// whose internal `.expect()` re-triggers the identical failure as a panic.
+/// A non-empty root set forces reqwest onto the `Verifier::new_with_extra_roots`
+/// branch, which never errors on an empty store and still *merges* whatever the
+/// native store provides (e.g. a corporate root via `SSL_CERT_FILE`).
+fn bundled_root_certificates() -> Vec<Certificate> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|cert| Certificate {
+            encoding: CertificateEncoding::Der,
+            data: cert.as_ref().to_vec(),
+        })
+        .collect()
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
@@ -2640,7 +2662,7 @@ impl Default for ClientConfig {
             accept_invalid_certificates: false,
             use_monolithic_push: false,
             tls_certs_only: Vec::new(),
-            extra_root_certificates: Vec::new(),
+            extra_root_certificates: bundled_root_certificates(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
             push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
@@ -2796,6 +2818,30 @@ mod test {
 
     use bytes::Bytes;
     use rstest::rstest;
+
+    /// Regression: every default-constructed `ClientConfig` ships the full
+    /// bundled Mozilla CA root set, so a client built on a host with no system
+    /// trust store never hits the empty-store `Verifier::new` panic. This covers
+    /// every direct construction (`ClientConfig::default()`, `..Default::default()`),
+    /// including callers that bypass a higher-level builder.
+    #[test]
+    fn default_config_seeds_bundled_ca_roots() {
+        let config = ClientConfig::default();
+        assert_eq!(
+            config.extra_root_certificates.len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len(),
+            "the full Mozilla root set must be seeded into ClientConfig::default()"
+        );
+        assert!(
+            config.extra_root_certificates.len() > 100,
+            "the Mozilla root set should be well over 100 certificates, got {}",
+            config.extra_root_certificates.len()
+        );
+        // Building the client runs `convert_certificates` (DER decode) over every
+        // seeded root; reaching this line proves the encoding is valid and the
+        // empty-store panic branch is unreachable.
+        let _client = Client::try_from(config).expect("client builds with bundled roots");
+    }
     use sha2::Digest as _;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
