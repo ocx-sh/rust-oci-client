@@ -302,7 +302,7 @@ impl Default for Client {
             config: Arc::default(),
             auth_store: Arc::default(),
             tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
-            client: reqwest::Client::default(),
+            client: default_seeded_client(),
             push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
         }
     }
@@ -377,7 +377,12 @@ impl TryFrom<ClientConfig> for Client {
             tokens: TokenCache::new(default_token_expiration_secs),
             client: client_builder.build()?,
             push_chunk_size,
-            ..Default::default()
+            // Explicit `auth_store` rather than `..Default::default()`: the
+            // struct-update tail would eagerly build a throwaway `Client::default()`
+            // — its `reqwest::Client::default()` panics on a host with no system
+            // trust store, defeating the seeded `client_builder` above. Fill the
+            // one remaining field directly and never construct that throwaway.
+            auth_store: Arc::default(),
         })
     }
 }
@@ -2653,6 +2658,31 @@ fn bundled_root_certificates() -> Vec<Certificate> {
         .collect()
 }
 
+/// `reqwest::Client` seeded with the bundled Mozilla roots — the panic-free
+/// replacement for `reqwest::Client::default()` in `Client::default()`.
+///
+/// `reqwest::Client::default()` hard-panics on a host with no system trust
+/// store: reqwest's rustls path takes `Verifier::new`, which errors on an empty
+/// store, and `Client::new` `.expect()`s the build. Because `Client::default()`
+/// is what every `..Default::default()` tail constructs to fill `auth_store`,
+/// that panic fires even when the real, seeded client built alongside it is
+/// fine. Seeding the bundled roots takes the `Verifier::new_with_extra_roots`
+/// path, which never errors on an empty store and still merges the native store
+/// (`SSL_CERT_FILE` / `SSL_CERT_DIR`) on top.
+fn default_seeded_client() -> reqwest::Client {
+    match convert_certificates(&bundled_root_certificates()) {
+        Ok(certs) => reqwest::Client::builder()
+            .tls_certs_merge(certs)
+            .build()
+            // ponytail: a seeded build cannot hit the empty-store error the roots
+            // exist to prevent; any other builder failure is genuinely exceptional,
+            // so fall back to the stock default (itself fine when a system store
+            // is present — the only case the seeded build could plausibly fail).
+            .unwrap_or_default(),
+        Err(_) => reqwest::Client::default(),
+    }
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
@@ -2841,6 +2871,33 @@ mod test {
         // seeded root; reaching this line proves the encoding is valid and the
         // empty-store panic branch is unreachable.
         let _client = Client::try_from(config).expect("client builds with bundled roots");
+    }
+
+    /// Regression for the empty-store panic that `default_config_seeds_bundled_ca_roots`
+    /// could not catch: it builds on a dev host *with* a system store, so the
+    /// `..Default::default()` tail's throwaway `reqwest::Client::default()` never
+    /// panicked there. Force an empty system store (`SSL_CERT_FILE` → an empty
+    /// file, `SSL_CERT_DIR` → a missing dir) and assert both constructors return
+    /// instead of panicking. Fails on the pre-fix code (panics through
+    /// `Client::default` → `reqwest::Client::default`).
+    #[test]
+    fn builds_without_a_system_trust_store() {
+        // rustls-native-certs reads these at each `Verifier::new*`; after the fix
+        // every construction is seeded, so a concurrent test that also builds a
+        // client still succeeds under the same env.
+        std::env::set_var("SSL_CERT_FILE", "/dev/null");
+        std::env::set_var("SSL_CERT_DIR", "/oci-client-no-such-dir");
+
+        // Direct `..Default::default()` path (the login auth-ping shape).
+        let _ = Client::new(ClientConfig::default());
+        // The explicit try_from path returns Ok rather than panicking.
+        Client::try_from(ClientConfig::default())
+            .expect("client builds with no system trust store");
+        // `Client::default()` itself must not panic (it backs every fallback).
+        let _ = Client::default();
+
+        std::env::remove_var("SSL_CERT_FILE");
+        std::env::remove_var("SSL_CERT_DIR");
     }
     use sha2::Digest as _;
     use tempfile::TempDir;
