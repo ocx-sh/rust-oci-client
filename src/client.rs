@@ -370,6 +370,10 @@ impl TryFrom<ClientConfig> for Client {
             client_builder = client_builder.proxy(proxy);
         }
 
+        if let Some(resolver) = &config.dns_resolver {
+            client_builder = client_builder.dns_resolver(resolver.clone());
+        }
+
         let default_token_expiration_secs = config.default_token_expiration_secs;
         let push_chunk_size = config.push_chunk_size;
         Ok(Self {
@@ -2582,6 +2586,14 @@ pub struct ClientConfig {
     /// during an image pull.
     pub platform_resolver: Option<Box<PlatformResolverFn>>,
 
+    /// An optional custom DNS resolver, injected into the underlying
+    /// `reqwest::Client` at build time. When set, every connection resolves host
+    /// names through it, and reqwest connects only to the addresses it returns.
+    /// This is the seam a caller uses to pin an externally-validated address at
+    /// connect time (e.g. an SSRF resolve -> validate -> pin guard). Defaults to
+    /// `None`, which keeps reqwest's built-in resolver.
+    pub dns_resolver: Option<std::sync::Arc<dyn reqwest::dns::Resolve>>,
+
     /// Maximum chunk size in bytes used to perform a `push` operation.
     ///
     /// This defaults to [`DEFAULT_PUSH_CHUNK_SIZE`].
@@ -2694,6 +2706,7 @@ impl Default for ClientConfig {
             tls_certs_only: Vec::new(),
             extra_root_certificates: bundled_root_certificates(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
+            dns_resolver: None,
             push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
             max_concurrent_download: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
