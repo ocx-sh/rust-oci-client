@@ -1787,12 +1787,29 @@ impl Client {
             .send()
             .await?;
 
+        // The registry reports what it actually stored via `Range: [bytes=]0-<end>`
+        // (inclusive, from byte 0 of the blob). Trusting our own offsets when the
+        // server accepted fewer bytes would send the next chunk at the wrong start,
+        // and the final PUT would then commit a blob that does not match the digest
+        // naming it. Neither body shape here can be rewound, so a disagreement is a
+        // hard stop: `SpecViolationError` is the variant callers already treat as
+        // "restart this blob", so `push_blob` retries it monolithically and
+        // `push_blob_stream`'s caller re-pushes from a fresh body.
+        let accepted_end = res.headers().get("Range").and_then(parse_range_end);
+        let next_location = self
+            .extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
+            .await?;
+        match accepted_end {
+            Some(accepted_end) if accepted_end != end_range_inclusive => {
+                return Err(OciDistributionError::SpecViolationError(format!(
+                    "registry accepted bytes 0-{accepted_end} of the chunk sent as {range_start}-{end_range_inclusive}"
+                )));
+            }
+            _ => {}
+        }
+
         // Returns location for next chunk and the start byte for the next range
-        Ok((
-            self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
-                .await?,
-            end_range_inclusive + 1,
-        ))
+        Ok((next_location, end_range_inclusive + 1))
     }
 
     /// Pushes a single buffered chunk of a blob, as part of a chunked blob upload.
@@ -2284,6 +2301,21 @@ impl Client {
         }
         Ok(url.into())
     }
+}
+
+/// Parses the inclusive end offset out of an upload-progress `Range` header.
+///
+/// Registries answer a chunk `PATCH` with the range they have stored so far,
+/// counted from byte 0 of the blob — `0-1023`, and with the optional unit prefix
+/// `bytes=0-1023`. Anything else (a missing start, a non-numeric end, a start
+/// other than 0) yields `None`, which the caller reads as "the registry did not
+/// report progress" rather than as a disagreement.
+fn parse_range_end(header: &reqwest::header::HeaderValue) -> Option<usize> {
+    let value = header.to_str().ok()?.trim();
+    let value = value.strip_prefix("bytes=").unwrap_or(value);
+    let (start, end) = value.split_once('-')?;
+    (start.trim() == "0").then_some(())?;
+    end.trim().parse().ok()
 }
 
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
