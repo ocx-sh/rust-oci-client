@@ -1,3 +1,5 @@
+//! Token cache for OCI registry authentication
+
 use oci_spec::distribution::Reference;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -11,9 +13,17 @@ use tracing::{debug, warn};
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RegistryToken {
-    Token { token: String },
-    AccessToken { access_token: String },
+pub enum RegistryToken {
+    /// Token value
+    Token {
+        /// The string value of the token
+        token: String,
+    },
+    /// AccessToken value
+    AccessToken {
+        /// The string value of the access_token
+        access_token: String,
+    },
 }
 
 impl fmt::Debug for RegistryToken {
@@ -32,16 +42,21 @@ impl fmt::Debug for RegistryToken {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum RegistryTokenType {
+/// Type of registry auth token
+pub enum RegistryTokenType {
+    /// Bearer auth token type
     Bearer(RegistryToken),
+    /// Basic auth token type
     Basic(String, String),
 }
 
 impl RegistryToken {
+    /// Returns the bearer token in a form suitable to use for an Authorization header
     pub fn bearer_token(&self) -> String {
         format!("Bearer {}", self.token())
     }
 
+    /// Returns the token value
     pub fn token(&self) -> &str {
         match self {
             RegistryToken::Token { token } => token,
@@ -77,7 +92,8 @@ struct TokenCacheValue {
 }
 
 #[derive(Clone)]
-pub(crate) struct TokenCache {
+/// A cache to hold authentication tokens
+pub struct TokenCache {
     // (registry, repository, scope) -> (token, expiration)
     tokens: Arc<RwLock<BTreeMap<TokenCacheKey, TokenCacheValue>>>,
     /// Default token expiration in seconds, to use when claim doesn't specify a value
@@ -92,7 +108,8 @@ impl TokenCache {
         }
     }
 
-    pub(crate) async fn insert(
+    /// Insert a token corresponding to reference and operation keys
+    pub async fn insert(
         &self,
         reference: &Reference,
         op: RegistryOperation,
@@ -178,7 +195,7 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
                         .expect("Time went backwards")
                         .as_secs();
                     let expiration = epoch + default_expiration_secs as u64;
-                    debug!(?token, "Cannot extract expiration from token's claims, assuming a {} seconds validity", default_expiration_secs);
+                    debug!("Cannot extract expiration from token's claims, assuming a {} seconds validity", default_expiration_secs);
                     expiration
                 }
             };
@@ -246,6 +263,7 @@ mod tests {
 
     #[test]
     fn jwt_with_exp_uses_claims_expiration() {
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
         let token = make_jwt_with_exp(9999999999);
         let exp = parse_expiration_from_jwt(&token, 60)
             .expect("should return Some for valid JWT with exp");
@@ -254,6 +272,7 @@ mod tests {
 
     #[test]
     fn jwt_without_exp_uses_default_expiration() {
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
         let token = make_jwt_without_exp();
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
