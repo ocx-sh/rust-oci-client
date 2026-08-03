@@ -483,6 +483,41 @@ pub struct Platform {
     pub features: Option<Vec<String>>,
 }
 
+impl PartialOrd for Platform {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A total order over exactly the fields `PartialEq` compares, so a `Platform`
+/// can key an ordered map.
+///
+/// Not derivable: `Arch` and `Os` come from `oci_spec` and implement neither
+/// `Ord` nor `PartialOrd`. Both are injective over their `Display` strings for
+/// every value a manifest can produce — an unrecognised name deserializes into
+/// `Other(name)` and prints back as `name`, and a recognised one never reaches
+/// `Other` — so ordering by that string agrees with equality.
+impl Ord for Platform {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.os.to_string(),
+            self.architecture.to_string(),
+            &self.os_version,
+            &self.os_features,
+            &self.variant,
+            &self.features,
+        )
+            .cmp(&(
+                other.os.to_string(),
+                other.architecture.to_string(),
+                &other.os_version,
+                &other.os_features,
+                &other.variant,
+                &other.features,
+            ))
+    }
+}
+
 impl std::fmt::Display for Platform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let os_version = self
