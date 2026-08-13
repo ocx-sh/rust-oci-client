@@ -933,6 +933,7 @@ impl Client {
         };
 
         let realm = challenge.realm.as_ref();
+        self.require_secure_realm(image, realm)?;
         let service = challenge.service.as_ref();
         let mut query = vec![("scope", &scope)];
 
@@ -2276,6 +2277,33 @@ impl Client {
         })
     }
 
+    /// Refuses a token-service realm that would carry credentials in the clear.
+    ///
+    /// The realm comes verbatim from the registry's `WWW-Authenticate` header
+    /// and is fetched with the user's Basic credentials attached, so a registry
+    /// answering `realm="http://…"` collects the password in cleartext
+    /// (CWE-522 / CWE-319). A cross-*host* realm is legitimate and stays
+    /// allowed — federated token services are how Docker Hub works
+    /// (`registry-1.docker.io` → `auth.docker.io`) — but a registry we reached
+    /// over HTTPS may not hand its credentials to a plaintext one.
+    ///
+    /// Keyed on this registry's own scheme, never on a plain-HTTP allowance
+    /// granted to some other host: a registry deliberately configured as
+    /// plaintext may name a plaintext realm, and an unrelated allowance must
+    /// not be able to redirect a credential.
+    fn require_secure_realm(&self, image: &Reference, realm: &str) -> Result<()> {
+        let registry = image.resolve_registry();
+        if self.config.protocol.scheme_for(registry) != "https" {
+            return Ok(());
+        }
+        match Url::parse(realm) {
+            Ok(url) if url.scheme() == "https" => Ok(()),
+            _ => Err(OciDistributionError::InsecureAuthRealm {
+                realm: realm.to_string(),
+            }),
+        }
+    }
+
     /// Whether `url` shares the origin (scheme, host, port) the image reference
     /// resolves to.
     ///
@@ -3313,6 +3341,48 @@ mod test {
             .headers()["Authorization"],
             format!("Bearer {}", &token)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_auth_realm_is_refused_for_an_https_registry() -> anyhow::Result<()> {
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+
+        let https = Client::default();
+        https.require_secure_realm(&image, "https://auth.example.com/token")?;
+        for realm in [
+            "http://auth.example.com/token",
+            "http://webassembly.azurecr.io/token",
+            "not a url",
+        ] {
+            let err = https
+                .require_secure_realm(&image, realm)
+                .expect_err("an https registry must not name a plaintext realm");
+            assert!(
+                matches!(err, OciDistributionError::InsecureAuthRealm { realm: ref r } if r == realm),
+                "unexpected error for {realm}: {err:?}"
+            );
+        }
+
+        // A registry deliberately configured as plaintext may name a plaintext
+        // realm - there is no credential to downgrade that the registry call
+        // itself did not already carry.
+        let plaintext = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec!["webassembly.azurecr.io".to_string()]),
+            ..Default::default()
+        });
+        plaintext.require_secure_realm(&image, "http://auth.example.com/token")?;
+
+        // An allowance granted to a DIFFERENT host does not license a plaintext
+        // realm for this one.
+        let elsewhere = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec!["other.example.com".to_string()]),
+            ..Default::default()
+        });
+        elsewhere
+            .require_secure_realm(&image, "http://auth.example.com/token")
+            .expect_err("an unrelated plain-HTTP allowance must not redirect a credential");
 
         Ok(())
     }

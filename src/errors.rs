@@ -40,6 +40,13 @@ pub enum OciDistributionError {
     /// Registry returned a layer with an incompatible type
     #[error("Incompatible layer media type: {0}")]
     IncompatibleLayerMediaTypeError(String),
+    /// The registry named a plaintext token-service realm while itself being
+    /// reached over HTTPS
+    #[error("Refusing to send credentials to a plaintext authentication realm: {realm}")]
+    InsecureAuthRealm {
+        /// The realm URL taken from the registry's `WWW-Authenticate` header
+        realm: String,
+    },
     /// IO Error
     #[error(transparent)]
     IoError(#[from] std::io::Error),
