@@ -13,6 +13,15 @@ pub enum OciDistributionError {
     #[error("Failed to convert Config into ConfigFile: {0}")]
     /// Transparent wrapper around `std::string::FromUtf8Error`
     ConfigConversionError(String),
+    /// A registry-controlled URL named a host other than the registry's own,
+    /// and the request that would have followed it was refused
+    #[error("Refusing to send a request to {url}: not on registry {registry}")]
+    CrossHostRefused {
+        /// The registry-supplied URL that was refused
+        url: String,
+        /// The registry the image reference resolves to
+        registry: String,
+    },
     /// An error occurred with a digest operation
     #[error("Digest error: {0}")]
     DigestError(#[from] DigestError),

@@ -1672,8 +1672,9 @@ impl Client {
     ) -> Result<String> {
         let url = Url::parse_with_params(location, &[("digest", digest)])
             .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
+        self.require_same_registry(image, url.as_str())?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
-            .apply_auth_to_session_url(image, RegistryOperation::Push, url.as_str())
+            .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
             .header("Content-Length", 0)
@@ -1711,8 +1712,9 @@ impl Client {
         );
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
+        self.require_same_registry(image, &url)?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
-            .apply_auth_to_session_url(image, RegistryOperation::Push, &url)
+            .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
             .headers(headers)
@@ -1735,7 +1737,8 @@ impl Client {
         layer: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
-        let mut url = Url::parse(location).unwrap();
+        let mut url =
+            Url::parse(location).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
         url.query_pairs_mut().append_pair("digest", blob_digest);
         let url = url.to_string();
 
@@ -1751,8 +1754,9 @@ impl Client {
         );
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
+        self.require_same_registry(image, &url)?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
-            .apply_auth_to_session_url(image, RegistryOperation::Push, &url)
+            .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
             .headers(headers)
@@ -1792,8 +1796,9 @@ impl Client {
 
         debug!(?range_start, ?end_range_inclusive, chunk_len, ?location, "Pushing chunk");
 
+        self.require_same_registry(image, location)?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
-            .apply_auth_to_session_url(image, RegistryOperation::Push, location)
+            .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
             .headers(headers)
@@ -2249,6 +2254,26 @@ impl Client {
             let message = res.text().await?;
             Err(OciDistributionError::ServerError { url, code, message })
         }
+    }
+
+    /// Refuses a registry-supplied URL that is not on the reference's own
+    /// registry.
+    ///
+    /// An upload session's URL comes from a registry-controlled `Location`
+    /// header, so it can name any host. Following it hands that host this
+    /// registry's credentials (CWE-522 / CWE-200), the blob body, and a
+    /// request the caller never addressed — an internal address included
+    /// (CWE-918). Sending it unauthenticated would close only the first of
+    /// those three, so a cross-host session URL is refused outright. Relative
+    /// and same-host absolute `Location` values are unaffected.
+    fn require_same_registry(&self, image: &Reference, url: &str) -> Result<()> {
+        if self.is_same_registry_origin(image, url) {
+            return Ok(());
+        }
+        Err(OciDistributionError::CrossHostRefused {
+            url: url.to_string(),
+            registry: image.resolve_registry().to_string(),
+        })
     }
 
     /// Whether `url` shares the origin (scheme, host, port) the image reference
@@ -2766,40 +2791,6 @@ impl<'a> RequestBuilderWrapper<'a> {
         })
     }
 
-    /// Applies auth, but only for a URL on the reference's own registry.
-    ///
-    /// An upload session's URL comes from a registry-controlled `Location`
-    /// header, so it can name any host. Authenticating it unconditionally
-    /// hands this registry's bearer token or Basic credentials to whatever
-    /// host it names (CWE-522 / CWE-200) — the same reason the pull path
-    /// refuses to authenticate redirect targets (CVE-2020-15157). Relative and
-    /// same-host absolute `Location` values are unaffected; a cross-host one
-    /// is sent unauthenticated rather than refused, so a registry that hands
-    /// uploads to pre-signed object storage keeps working.
-    async fn apply_auth_to_session_url(
-        &self,
-        image: &Reference,
-        op: RegistryOperation,
-        url: &str,
-    ) -> Result<RequestBuilderWrapper<'_>> {
-        if self.client.is_same_registry_origin(image, url) {
-            return self.apply_auth(image, op).await;
-        }
-
-        warn!(
-            %url,
-            registry = image.resolve_registry(),
-            "upload session URL is not on the registry's own host; sending it without credentials"
-        );
-        Ok(RequestBuilderWrapper {
-            client: self.client,
-            request_builder: self.request_builder.try_clone().ok_or_else(|| {
-                OciDistributionError::GenericError(Some(
-                    "could not clone request builder".to_string(),
-                ))
-            })?,
-        })
-    }
 }
 
 /// The encoding of the certificate
@@ -3326,59 +3317,31 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn apply_auth_to_session_url_only_authenticates_the_registry_host() -> anyhow::Result<()> {
-        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
+    #[test]
+    fn session_url_off_the_registry_host_is_refused() -> anyhow::Result<()> {
         let client = Client::default();
         let image = Reference::try_from(HELLO_IMAGE_TAG)?;
-        let token = jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
-            &EmptyClaims {},
-            &jsonwebtoken::EncodingKey::from_secret(b"some-secret"),
-        )?;
 
-        // Stored auth is what gets us as far as the token cache check.
-        client
-            .store_auth(image.resolve_registry(), RegistryAuth::Anonymous)
-            .await;
-        client
-            .tokens
-            .insert(
-                &image,
-                RegistryOperation::Push,
-                RegistryTokenType::Bearer(RegistryToken::Token {
-                    token: token.clone(),
-                }),
-            )
-            .await;
+        client.require_same_registry(&image, "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc")?;
 
-        let same_host = "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc";
-        assert_eq!(
-            RequestBuilderWrapper::from_client(&client, |c| c.patch(same_host))
-                .apply_auth_to_session_url(&image, RegistryOperation::Push, same_host)
-                .await?
-                .into_request_builder()
-                .build()?
-                .headers()["Authorization"],
-            format!("Bearer {token}")
-        );
-
-        // A registry answering the upload-session POST with a foreign Location -
-        // or downgrading the scheme on its own host - must not receive the
-        // registry's credentials on the follow-up PATCH/PUT.
+        // A registry answering the upload-session POST with a foreign Location,
+        // downgrading the scheme on its own host, or naming something that is
+        // not an http(s) URL at all, gets no follow-up request - not an
+        // unauthenticated one either, since the body and the target host are
+        // registry-chosen too.
         for url in [
             "https://evil.example.com/v2/hello-wasm/blobs/uploads/abc",
             "http://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+            "https://webassembly.azurecr.io:8443/v2/hello-wasm/blobs/uploads/abc",
+            "file:///etc/passwd",
+            "not a url",
         ] {
+            let err = client
+                .require_same_registry(&image, url)
+                .expect_err("cross-host session URL must be refused");
             assert!(
-                !RequestBuilderWrapper::from_client(&client, |c| c.patch(url))
-                    .apply_auth_to_session_url(&image, RegistryOperation::Push, url)
-                    .await?
-                    .into_request_builder()
-                    .build()?
-                    .headers()
-                    .contains_key("Authorization"),
-                "credentials leaked to {url}"
+                matches!(err, OciDistributionError::CrossHostRefused { url: ref u, .. } if u == url),
+                "unexpected error for {url}: {err:?}"
             );
         }
 
