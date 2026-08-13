@@ -1659,7 +1659,7 @@ impl Client {
         let url = Url::parse_with_params(location, &[("digest", digest)])
             .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
+            .apply_auth_to_session_url(image, RegistryOperation::Push, url.as_str())
             .await?
             .into_request_builder()
             .header("Content-Length", 0)
@@ -1698,7 +1698,7 @@ impl Client {
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
-            .apply_auth(image, RegistryOperation::Push)
+            .apply_auth_to_session_url(image, RegistryOperation::Push, &url)
             .await?
             .into_request_builder()
             .headers(headers)
@@ -1738,7 +1738,7 @@ impl Client {
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
-            .apply_auth(image, RegistryOperation::Push)
+            .apply_auth_to_session_url(image, RegistryOperation::Push, &url)
             .await?
             .into_request_builder()
             .headers(headers)
@@ -1779,7 +1779,7 @@ impl Client {
         debug!(?range_start, ?end_range_inclusive, chunk_len, ?location, "Pushing chunk");
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
-            .apply_auth(image, RegistryOperation::Push)
+            .apply_auth_to_session_url(image, RegistryOperation::Push, location)
             .await?
             .into_request_builder()
             .headers(headers)
@@ -2187,6 +2187,23 @@ impl Client {
         }
     }
 
+    /// Whether `url` shares the origin (scheme, host, port) the image reference
+    /// resolves to.
+    ///
+    /// Fails closed: a URL neither side can parse counts as a mismatch, and so
+    /// does an opaque origin (a non-http(s) scheme).
+    fn is_same_registry_origin(&self, image: &Reference, url: &str) -> bool {
+        let registry = image.resolve_registry();
+        let scheme = self.config.protocol.scheme_for(registry);
+        match (
+            Url::parse(&format!("{scheme}://{registry}/")),
+            Url::parse(url),
+        ) {
+            (Ok(expected), Ok(actual)) => expected.origin() == actual.origin(),
+            _ => false,
+        }
+    }
+
     /// Helper function to convert location header to URL
     ///
     /// Location may be absolute (containing the protocol and/or hostname), or relative (containing just the URL path)
@@ -2546,6 +2563,41 @@ impl<'a> RequestBuilderWrapper<'a> {
                     ))
                 })?
                 .headers(headers),
+        })
+    }
+
+    /// Applies auth, but only for a URL on the reference's own registry.
+    ///
+    /// An upload session's URL comes from a registry-controlled `Location`
+    /// header, so it can name any host. Authenticating it unconditionally
+    /// hands this registry's bearer token or Basic credentials to whatever
+    /// host it names (CWE-522 / CWE-200) — the same reason the pull path
+    /// refuses to authenticate redirect targets (CVE-2020-15157). Relative and
+    /// same-host absolute `Location` values are unaffected; a cross-host one
+    /// is sent unauthenticated rather than refused, so a registry that hands
+    /// uploads to pre-signed object storage keeps working.
+    async fn apply_auth_to_session_url(
+        &self,
+        image: &Reference,
+        op: RegistryOperation,
+        url: &str,
+    ) -> Result<RequestBuilderWrapper<'_>> {
+        if self.client.is_same_registry_origin(image, url) {
+            return self.apply_auth(image, op).await;
+        }
+
+        warn!(
+            %url,
+            registry = image.resolve_registry(),
+            "upload session URL is not on the registry's own host; sending it without credentials"
+        );
+        Ok(RequestBuilderWrapper {
+            client: self.client,
+            request_builder: self.request_builder.try_clone().ok_or_else(|| {
+                OciDistributionError::GenericError(Some(
+                    "could not clone request builder".to_string(),
+                ))
+            })?,
         })
     }
 }
@@ -3070,6 +3122,65 @@ mod test {
             .headers()["Authorization"],
             format!("Bearer {}", &token)
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_auth_to_session_url_only_authenticates_the_registry_host() -> anyhow::Result<()> {
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
+        let client = Client::default();
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &EmptyClaims {},
+            &jsonwebtoken::EncodingKey::from_secret(b"some-secret"),
+        )?;
+
+        // Stored auth is what gets us as far as the token cache check.
+        client
+            .store_auth(image.resolve_registry(), RegistryAuth::Anonymous)
+            .await;
+        client
+            .tokens
+            .insert(
+                &image,
+                RegistryOperation::Push,
+                RegistryTokenType::Bearer(RegistryToken::Token {
+                    token: token.clone(),
+                }),
+            )
+            .await;
+
+        let same_host = "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc";
+        assert_eq!(
+            RequestBuilderWrapper::from_client(&client, |c| c.patch(same_host))
+                .apply_auth_to_session_url(&image, RegistryOperation::Push, same_host)
+                .await?
+                .into_request_builder()
+                .build()?
+                .headers()["Authorization"],
+            format!("Bearer {token}")
+        );
+
+        // A registry answering the upload-session POST with a foreign Location -
+        // or downgrading the scheme on its own host - must not receive the
+        // registry's credentials on the follow-up PATCH/PUT.
+        for url in [
+            "https://evil.example.com/v2/hello-wasm/blobs/uploads/abc",
+            "http://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        ] {
+            assert!(
+                !RequestBuilderWrapper::from_client(&client, |c| c.patch(url))
+                    .apply_auth_to_session_url(&image, RegistryOperation::Push, url)
+                    .await?
+                    .into_request_builder()
+                    .build()?
+                    .headers()
+                    .contains_key("Authorization"),
+                "credentials leaked to {url}"
+            );
+        }
 
         Ok(())
     }
