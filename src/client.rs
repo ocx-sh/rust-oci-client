@@ -316,6 +316,42 @@ pub trait ClientConfigSource {
     fn client_config(&self) -> ClientConfig;
 }
 
+/// reqwest's default redirect limit, restated because a custom policy replaces
+/// the default wholesale rather than wrapping it.
+const MAX_REDIRECTS: usize = 10;
+
+/// Follows redirects like reqwest's default, except never from `https` to
+/// `http`.
+///
+/// reqwest drops `Authorization` when a redirect changes host or port, but not
+/// when it changes only the scheme, so a registry on an explicit port answering
+/// `https://reg:8443/…` with `Location: http://reg:8443/…` keeps the bearer
+/// token and sends it in the clear (CWE-319). Redirects are load-bearing on the
+/// pull path — registries hand blobs off to CDNs that way — so refusing all of
+/// them (`Policy::none`) is not an option, and `https_only` would break
+/// registries deliberately configured as plain HTTP.
+fn no_scheme_downgrade_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if is_scheme_downgrade(attempt.previous().last(), attempt.url()) {
+            let refusal = format!("refusing a redirect from HTTPS to plaintext {}", attempt.url());
+            return attempt.error(OciDistributionError::GenericError(Some(refusal)));
+        }
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.stop();
+        }
+        attempt.follow()
+    })
+}
+
+/// Whether following `next` would move a request from TLS to the clear.
+///
+/// The decision `no_scheme_downgrade_policy` is built on, factored out because
+/// `reqwest::redirect::Attempt` cannot be constructed outside reqwest, so the
+/// closure itself has no test seam.
+fn is_scheme_downgrade(previous: Option<&Url>, next: &Url) -> bool {
+    previous.is_some_and(|previous| previous.scheme() == "https" && next.scheme() == "http")
+}
+
 impl TryFrom<ClientConfig> for Client {
     type Error = OciDistributionError;
 
@@ -373,6 +409,8 @@ impl TryFrom<ClientConfig> for Client {
         if let Some(resolver) = &config.dns_resolver {
             client_builder = client_builder.dns_resolver(resolver.clone());
         }
+
+        client_builder = client_builder.redirect(no_scheme_downgrade_policy());
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
         let push_chunk_size = config.push_chunk_size;
@@ -3341,6 +3379,36 @@ mod test {
             .headers()["Authorization"],
             format!("Bearer {}", &token)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn scheme_downgrade_is_the_only_refused_redirect() -> anyhow::Result<()> {
+        let https = Url::parse("https://registry.example.com:8443/v2/x/blobs/uploads/1")?;
+        let plaintext = Url::parse("http://registry.example.com:8443/collect")?;
+
+        // Same host, same port, scheme dropped: reqwest keeps `Authorization`
+        // here, which is exactly why this arm exists.
+        assert!(is_scheme_downgrade(Some(&https), &plaintext));
+
+        // Everything else keeps working - CDN handoff on the pull path is a
+        // cross-host https redirect, and a plain-HTTP registry stays plain.
+        for (previous, next) in [
+            ("https://registry.example.com/v2/x", "https://cdn.example.net/blob"),
+            ("http://registry.example.com/v2/x", "http://registry.example.com/other"),
+            ("http://registry.example.com/v2/x", "https://registry.example.com/other"),
+        ] {
+            let previous = Url::parse(previous)?;
+            let next = Url::parse(next)?;
+            assert!(
+                !is_scheme_downgrade(Some(&previous), &next),
+                "{previous} -> {next} must still follow"
+            );
+        }
+
+        // The first hop has no predecessor to downgrade from.
+        assert!(!is_scheme_downgrade(None, &plaintext));
 
         Ok(())
     }
