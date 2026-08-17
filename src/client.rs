@@ -2036,6 +2036,47 @@ impl Client {
         Ok(manifest)
     }
 
+    /// Native-only referrers lookup that distinguishes an unsupported registry
+    /// from a supported one with zero referrers.
+    ///
+    /// Unlike [`Self::pull_referrers`], this does NOT fall back to the referrers
+    /// tag schema: it performs only the native `/v2/<name>/referrers/<digest>`
+    /// GET. A `404` on that endpoint returns `Ok(None)` — the registry does not
+    /// implement the native OCI 1.1 Referrers API. A `200` returns
+    /// `Ok(Some(index))` (supported; the index may be empty). Any other status
+    /// is an error. Callers that need the OCI-spec tag-schema fallback should
+    /// use [`Self::pull_referrers`]; callers that must fail hard on an
+    /// unsupported registry (rather than silently returning an empty list) use
+    /// this.
+    pub async fn pull_referrers_native(
+        &self,
+        image: &Reference,
+        artifact_type: Option<&str>,
+    ) -> Result<Option<OciImageIndex>> {
+        let url = self.to_v2_referrers_url(image, artifact_type)?;
+        debug!("Pulling referrers (native-only) from {}", url);
+
+        let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        let status = res.status();
+        let body = res.bytes().await?;
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        validate_registry_response(status, &body, &url)?;
+        let manifest = serde_json::from_slice(&body)
+            .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
+
+        Ok(Some(manifest))
+    }
+
     /// Pulls the referrers index using the OCI referrers tag schema fallback.
     ///
     /// The tag is the subject digest with `:` replaced by `-`
