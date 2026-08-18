@@ -82,6 +82,18 @@ pub enum OciDistributionError {
         /// Error message returned by the remote server
         message: String,
     },
+    /// A response body exceeded the ceiling the client applies to it.
+    ///
+    /// Raised for registry-controlled responses whose length nothing in the
+    /// protocol bounds — the referrers index above all, since its size is a
+    /// function of how many artifacts the peer chooses to claim.
+    #[error("response from {url} exceeds the {limit} byte limit")]
+    ResponseTooLargeError {
+        /// Request URL
+        url: String,
+        /// The ceiling that was exceeded, in bytes
+        limit: u64,
+    },
     /// The [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md)
     /// is not respected by the remote registry
     #[error("OCI distribution spec violation: {0}")]

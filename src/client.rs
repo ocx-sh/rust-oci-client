@@ -2064,15 +2064,24 @@ impl Client {
             .send()
             .await?;
         let status = res.status();
-        let body = res.bytes().await?;
-
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
 
+        let body = read_body_bounded(res, &url, MAX_REFERRERS_INDEX_BYTES).await?;
         validate_registry_response(status, &body, &url)?;
-        let manifest = serde_json::from_slice(&body)
+        let manifest: OciImageIndex = serde_json::from_slice(&body)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
+
+        // The byte cap alone does not bound the work a caller does per entry, and
+        // a compact descriptor is ~200 bytes: 4 MiB of them is tens of thousands
+        // of signatures to fetch and verify for one subject.
+        if manifest.manifests.len() > MAX_REFERRERS_DESCRIPTORS {
+            return Err(OciDistributionError::SpecViolationError(format!(
+                "referrers index at {url} lists {} descriptors, above the {MAX_REFERRERS_DESCRIPTORS} limit",
+                manifest.manifests.len()
+            )));
+        }
 
         Ok(Some(manifest))
     }
@@ -2379,6 +2388,49 @@ fn parse_range_end(header: &reqwest::header::HeaderValue) -> Option<usize> {
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
 /// Obviously, HTTP servers are going to send other codes. This tries to catch the
 /// obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
+/// Byte ceiling on a referrers index response.
+///
+/// Nothing in the distribution spec bounds this body: its length is a function
+/// of how many artifacts the registry claims refer to the subject. 4 MiB is far
+/// above any real index and far below a memory-pressure event.
+const MAX_REFERRERS_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Descriptor-count ceiling on a referrers index.
+const MAX_REFERRERS_DESCRIPTORS: usize = 4096;
+
+/// Read a response body, refusing anything past `limit` bytes.
+///
+/// `Response::bytes` buffers whatever the peer sends, so it is not usable on a
+/// registry-controlled body with no protocol-level length bound. The declared
+/// `Content-Length` is treated as a hint worth refusing early on, never as the
+/// bound — the bound is the bytes actually counted through the stream.
+async fn read_body_bounded(response: Response, url: &str, limit: u64) -> Result<Vec<u8>> {
+    let too_large = || OciDistributionError::ResponseTooLargeError {
+        url: url.to_string(),
+        limit,
+    };
+
+    if let Some(declared) = response.content_length() {
+        if declared > limit {
+            return Err(too_large());
+        }
+    }
+
+    // Sized from the hint only after it has been clamped, so a hostile
+    // Content-Length cannot drive the allocation.
+    let hint = response.content_length().unwrap_or(0).min(limit);
+    let mut body = Vec::with_capacity(hint as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &str) -> Result<()> {
     match status {
         reqwest::StatusCode::OK => Ok(()),
