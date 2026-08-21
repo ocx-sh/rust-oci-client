@@ -1041,9 +1041,14 @@ impl Client {
             trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
             let final_url = self.note_manifest_redirect(image, &url, &res);
+            // Before the body is read: an HTML portal has no size a manifest
+            // reader should ever pull into memory. A non-200 keeps the old
+            // order — its body is the OCI error envelope.
+            if status == reqwest::StatusCode::OK {
+                validate_manifest_content_type(&headers, &final_url)?;
+            }
             let body = res.bytes().await?;
             validate_registry_response(status, &body, &final_url)?;
-            validate_manifest_content_type(&headers, &final_url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
                 .map_err(OciDistributionError::from)
@@ -1239,10 +1244,15 @@ impl Client {
         let status = res.status();
         let headers = res.headers().clone();
         let final_url = self.note_manifest_redirect(image, &url, &res);
+        // Before the body is read: an HTML portal has no size a manifest reader
+        // should ever pull into memory. A non-200 keeps the old order — its
+        // body is the OCI error envelope.
+        if status == reqwest::StatusCode::OK {
+            validate_manifest_content_type(&headers, &final_url)?;
+        }
         let body = res.bytes().await?;
 
         validate_registry_response(status, &body, &final_url)?;
-        validate_manifest_content_type(&headers, &final_url)?;
 
         let digest_header = digest_header_value(headers)?;
         let digest = validate_digest(&body, digest_header, image.digest())?;
