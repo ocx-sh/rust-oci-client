@@ -6,7 +6,8 @@
 //! it first, and the two shapes the gate must keep admitting.
 use std::net::SocketAddr;
 
-use axum::response::{IntoResponse, Response};
+use axum::extract::Path;
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
 use oci_client::client::{ClientConfig, ClientProtocol};
@@ -94,6 +95,49 @@ impl MisroutedRegistry {
     }
 }
 
+/// A host that answers every manifest request by bouncing the client onto
+/// `target` — a mirror pointed at a tenant that no longer serves the registry.
+struct Bouncer {
+    handle: JoinHandle<()>,
+    server: String,
+}
+
+impl Drop for Bouncer {
+    fn drop(&mut self) {
+        self.handle.abort()
+    }
+}
+
+impl Bouncer {
+    async fn new(target: String) -> Self {
+        let app =
+            Router::new().route(
+                "/v2/{repository}/manifests/{reference}",
+                get(move |Path((_, reference)): Path<(String, String)>| {
+                    let target = target.clone();
+                    async move {
+                        Redirect::temporary(&format!("{target}/v2/html/manifests/{reference}"))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let server = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self { handle, server }
+    }
+
+    fn reference(&self, repository: &str) -> Reference {
+        format!("{}/{repository}@{SUBJECT}", self.server)
+            .parse()
+            .unwrap()
+    }
+}
+
 #[tokio::test]
 async fn an_html_manifest_response_is_refused_before_the_digest_check() {
     let registry = MisroutedRegistry::new().await;
@@ -154,4 +198,33 @@ async fn a_manifest_response_typed_application_json_is_admitted() {
         .await
         .expect("a manifest typed application/json must be accepted");
     assert_eq!(body, MANIFEST.as_bytes());
+}
+
+#[tokio::test]
+async fn a_redirected_manifest_error_names_the_final_url() {
+    let portal = MisroutedRegistry::new().await;
+    let bouncer = Bouncer::new(format!("http://{}", portal.server)).await;
+
+    let error = portal
+        .client()
+        .pull_manifest_raw(
+            &bouncer.reference("anything"),
+            &RegistryAuth::Anonymous,
+            &["application/vnd.oci.image.manifest.v1+json"],
+        )
+        .await
+        .expect_err("a redirect onto an HTML portal must be refused");
+
+    let OciDistributionError::UnexpectedContentType { url, .. } = &error else {
+        panic!("expected a content-type refusal, got: {error}");
+    };
+    assert!(
+        url.contains(&portal.server),
+        "the error must name where the response came from ({}), got: {url}",
+        portal.server
+    );
+    assert!(
+        !url.contains(&bouncer.server),
+        "the error must not name the address the request was sent to, got: {url}"
+    );
 }

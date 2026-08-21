@@ -1040,9 +1040,10 @@ impl Client {
             let status = res.status();
             trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
+            let final_url = self.note_manifest_redirect(image, &url, &res);
             let body = res.bytes().await?;
-            validate_registry_response(status, &body, &url)?;
-            validate_manifest_content_type(&headers, &url)?;
+            validate_registry_response(status, &body, &final_url)?;
+            validate_manifest_content_type(&headers, &final_url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
                 .map_err(OciDistributionError::from)
@@ -1237,10 +1238,11 @@ impl Client {
             .await?;
         let status = res.status();
         let headers = res.headers().clone();
+        let final_url = self.note_manifest_redirect(image, &url, &res);
         let body = res.bytes().await?;
 
-        validate_registry_response(status, &body, &url)?;
-        validate_manifest_content_type(&headers, &url)?;
+        validate_registry_response(status, &body, &final_url)?;
+        validate_manifest_content_type(&headers, &final_url)?;
 
         let digest_header = digest_header_value(headers)?;
         let digest = validate_digest(&body, digest_header, image.digest())?;
@@ -2254,6 +2256,27 @@ impl Client {
             (Ok(expected), Ok(actual)) => expected.origin() == actual.origin(),
             _ => false,
         }
+    }
+
+    /// The URL a manifest response finally came from, warning when the client
+    /// was redirected off the registry's own origin.
+    ///
+    /// Every error raised about a manifest response must name this URL rather
+    /// than the one the request was addressed to: a mirror or proxy that
+    /// redirects to a login portal is otherwise indistinguishable from the
+    /// registry answering nonsense. The origin comparison includes the scheme,
+    /// so a plain http -> https upgrade warns too; that is deliberate, since
+    /// the point is visibility and the warning costs nothing.
+    fn note_manifest_redirect(&self, image: &Reference, url: &str, res: &Response) -> String {
+        let final_url = res.url().to_string();
+        if !self.is_same_registry_origin(image, &final_url) {
+            warn!(
+                request = %url,
+                redirected_to = %final_url,
+                "manifest request left the registry origin"
+            );
+        }
+        final_url
     }
 
     /// Helper function to convert location header to URL
