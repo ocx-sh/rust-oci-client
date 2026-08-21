@@ -104,6 +104,18 @@ pub enum OciDistributionError {
         /// request URL
         url: String,
     },
+    /// A manifest response arrived typed as something that cannot be a manifest.
+    ///
+    /// Read before the digest is verified: a captive portal, a proxy error page
+    /// or a mis-routed mirror answers 200 with HTML, and an unguarded client
+    /// reports that as corrupted content instead of a mis-delivered response.
+    #[error("unexpected content type '{content_type}' for a manifest response from {url}")]
+    UnexpectedContentType {
+        /// The content type the response declared
+        content_type: String,
+        /// The URL the response finally came from, after any redirects
+        url: String,
+    },
     /// Cannot parse URL
     #[error("Error parsing Url {0}")]
     UrlParseError(String),

@@ -1042,6 +1042,7 @@ impl Client {
             let headers = res.headers().clone();
             let body = res.bytes().await?;
             validate_registry_response(status, &body, &url)?;
+            validate_manifest_content_type(&headers, &url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
                 .map_err(OciDistributionError::from)
@@ -1239,6 +1240,7 @@ impl Client {
         let body = res.bytes().await?;
 
         validate_registry_response(status, &body, &url)?;
+        validate_manifest_content_type(&headers, &url)?;
 
         let digest_header = digest_header_value(headers)?;
         let digest = validate_digest(&body, digest_header, image.digest())?;
@@ -2429,6 +2431,32 @@ async fn read_body_bounded(response: Response, url: &str, limit: u64) -> Result<
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Refuses a manifest response whose declared type cannot be a manifest.
+///
+/// Runs on manifest GET paths only — a blob carries arbitrary content, and a
+/// HEAD answer carries no body to mistype. Registries legitimately omit the
+/// header, and the digest check still covers those bytes, so an absent header
+/// is admitted; anything present must be JSON.
+fn validate_manifest_content_type(headers: &HeaderMap, url: &str) -> Result<()> {
+    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
+        return Ok(());
+    };
+    let declared = String::from_utf8_lossy(value.as_bytes()).into_owned();
+    let essence = declared
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if essence == "application/json" || essence.ends_with("+json") {
+        return Ok(());
+    }
+    Err(OciDistributionError::UnexpectedContentType {
+        content_type: declared,
+        url: url.to_string(),
+    })
 }
 
 fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &str) -> Result<()> {
