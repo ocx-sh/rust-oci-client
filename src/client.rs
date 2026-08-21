@@ -2278,15 +2278,17 @@ impl Client {
     /// so a plain http -> https upgrade warns too; that is deliberate, since
     /// the point is visibility and the warning costs nothing.
     fn note_manifest_redirect(&self, image: &Reference, url: &str, res: &Response) -> String {
-        let final_url = res.url().to_string();
-        if !self.is_same_registry_origin(image, &final_url) {
+        // The origin comparison runs on the raw URL; only what is displayed is
+        // redacted, so a credential can never widen the same-origin decision.
+        let safe_url = redacted_display_url(res.url());
+        if !self.is_same_registry_origin(image, res.url().as_str()) {
             warn!(
                 request = %url,
-                redirected_to = %final_url,
+                redirected_to = %safe_url,
                 "manifest request left the registry origin"
             );
         }
-        final_url
+        safe_url
     }
 
     /// Helper function to convert location header to URL
@@ -2464,6 +2466,50 @@ async fn read_body_bounded(response: Response, url: &str, limit: u64) -> Result<
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Query parameter names whose value is a credential in every scheme that uses
+/// them — presigned S3/GCS/Azure URLs and the registry token exchange.
+const REDACTED_QUERY_PARAMS: &[&str] = &[
+    "x-amz-signature",
+    "x-amz-credential",
+    "signature",
+    "sig",
+    "token",
+    "access_token",
+];
+
+/// A URL safe to print, with userinfo dropped and signed-query values masked.
+///
+/// A redirect target is chosen by the registry, so anything displayed from it
+/// is attacker-influenced: a blob redirect to presigned storage carries its
+/// signature in the query, and a proxy can send credentials in userinfo. Both
+/// end up in an error message a user pastes into a bug report. Parameter names
+/// survive, because knowing a request was signed is the diagnosis.
+fn redacted_display_url(url: &Url) -> String {
+    let mut url = url.clone();
+    // Both fail only for a cannot-be-a-base URL, which has no userinfo to strip.
+    let _ = url.set_username(""); // redaction: nothing to strip on an opaque URL
+    let _ = url.set_password(None); // redaction: same
+
+    if url.query().is_some() {
+        let masked: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(name, value)| {
+                let value = if REDACTED_QUERY_PARAMS
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                {
+                    "***".to_string()
+                } else {
+                    value.into_owned()
+                };
+                (name.into_owned(), value)
+            })
+            .collect();
+        url.query_pairs_mut().clear().extend_pairs(masked);
+    }
+    url.to_string()
 }
 
 /// Refuses a manifest response whose declared type cannot be a manifest.

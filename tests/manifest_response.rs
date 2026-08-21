@@ -96,7 +96,8 @@ impl MisroutedRegistry {
 }
 
 /// A host that answers every manifest request by bouncing the client onto
-/// `target` — a mirror pointed at a tenant that no longer serves the registry.
+/// `template` (an absolute URL carrying a `{reference}` placeholder) — a mirror
+/// pointed at a tenant that no longer serves the registry.
 struct Bouncer {
     handle: JoinHandle<()>,
     server: String,
@@ -109,17 +110,14 @@ impl Drop for Bouncer {
 }
 
 impl Bouncer {
-    async fn new(target: String) -> Self {
-        let app =
-            Router::new().route(
-                "/v2/{repository}/manifests/{reference}",
-                get(move |Path((_, reference)): Path<(String, String)>| {
-                    let target = target.clone();
-                    async move {
-                        Redirect::temporary(&format!("{target}/v2/html/manifests/{reference}"))
-                    }
-                }),
-            );
+    async fn new(template: String) -> Self {
+        let app = Router::new().route(
+            "/v2/{repository}/manifests/{reference}",
+            get(move |Path((_, reference)): Path<(String, String)>| {
+                let template = template.clone();
+                async move { Redirect::temporary(&template.replace("{reference}", &reference)) }
+            }),
+        );
 
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -203,7 +201,11 @@ async fn a_manifest_response_typed_application_json_is_admitted() {
 #[tokio::test]
 async fn a_redirected_manifest_error_names_the_final_url() {
     let portal = MisroutedRegistry::new().await;
-    let bouncer = Bouncer::new(format!("http://{}", portal.server)).await;
+    let bouncer = Bouncer::new(format!(
+        "http://{}/v2/html/manifests/{{reference}}",
+        portal.server
+    ))
+    .await;
 
     let error = portal
         .client()
@@ -226,5 +228,48 @@ async fn a_redirected_manifest_error_names_the_final_url() {
     assert!(
         !url.contains(&bouncer.server),
         "the error must not name the address the request was sent to, got: {url}"
+    );
+}
+
+#[tokio::test]
+async fn a_redirected_manifest_error_redacts_credentials_from_the_url_it_names() {
+    let portal = MisroutedRegistry::new().await;
+    // Everything a redirect target can smuggle: userinfo, and a signed-URL
+    // style query token. Both would otherwise be printed verbatim in an error
+    // a user pastes into a bug report.
+    let bouncer = Bouncer::new(format!(
+        "http://user:secret@{}/v2/html/manifests/{{reference}}?ref=main&token=hunter2",
+        portal.server
+    ))
+    .await;
+
+    let error = portal
+        .client()
+        .pull_manifest_raw(
+            &bouncer.reference("anything"),
+            &RegistryAuth::Anonymous,
+            &["application/vnd.oci.image.manifest.v1+json"],
+        )
+        .await
+        .expect_err("a redirect onto an HTML portal must be refused");
+
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("secret"),
+        "the password must not survive into an error message: {rendered}"
+    );
+    assert!(
+        !rendered.contains("hunter2"),
+        "a signed-query value must not survive into an error message: {rendered}"
+    );
+    // Redaction must not cost the diagnosis: host, path and the harmless
+    // parameter still have to be there.
+    assert!(
+        rendered.contains(&portal.server) && rendered.contains("/v2/html/manifests/"),
+        "the error must still name where the response came from: {rendered}"
+    );
+    assert!(
+        rendered.contains("ref=main") && rendered.contains("token="),
+        "only the value is redacted, the parameter names stay: {rendered}"
     );
 }
