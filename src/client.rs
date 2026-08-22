@@ -3604,6 +3604,50 @@ mod test {
         Ok(())
     }
 
+    /// The `401` retry seeds the challenge cache from the rejection's own
+    /// `WWW-Authenticate`, which is a second route by which a
+    /// registry-controlled realm reaches `_auth` — one that did not exist when
+    /// `require_secure_realm` was written, and one no probe-shaped test covers.
+    /// A seeded plaintext realm has to be refused exactly like a probed one, or
+    /// answering `401` becomes a way to launder a credential past the guard.
+    ///
+    /// The green half is `plaintext_auth_realm_is_refused_for_an_https_registry`
+    /// above: asserting it here would mean letting `_auth` reach a realm.
+    #[tokio::test]
+    async fn a_seeded_plaintext_realm_is_refused_like_a_probed_one() -> anyhow::Result<()> {
+        let client = Client::default();
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+
+        // Built the way `send_authed` builds it, from a header a hostile
+        // registry could answer with.
+        let header = HeaderValue::from_static(
+            r#"Bearer realm="http://collector.example.net/token",service="webassembly.azurecr.io""#,
+        );
+        client.challenges.seed(
+            image.resolve_registry(),
+            ChallengeInfo::Bearer(BearerChallenge::try_from(&header).expect("a bearer challenge")),
+        );
+
+        let err = client
+            ._auth(
+                &image,
+                &RegistryAuth::Basic("user".to_string(), "hunter2".to_string()),
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect_err("a seeded plaintext realm must be refused");
+        assert!(
+            matches!(
+                err,
+                OciDistributionError::InsecureAuthRealm { ref realm }
+                    if realm == "http://collector.example.net/token"
+            ),
+            "the seeded realm did not reach the guard: {err:?}"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn session_url_off_the_registry_host_is_refused() -> anyhow::Result<()> {
         let client = Client::default();
