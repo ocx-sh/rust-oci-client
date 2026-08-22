@@ -75,10 +75,15 @@ impl HostileRegistry {
     async fn new() -> Self {
         let app = Router::new()
             .route("/v2/declared/referrers/{digest}", get(declared_oversize))
-            .route("/v2/undeclared/referrers/{digest}", get(undeclared_oversize))
+            .route(
+                "/v2/undeclared/referrers/{digest}",
+                get(undeclared_oversize),
+            )
             .route("/v2/many/referrers/{digest}", get(too_many_descriptors));
 
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
         let server = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -94,7 +99,9 @@ impl HostileRegistry {
     }
 
     fn reference(&self, repository: &str) -> Reference {
-        format!("{}/{repository}@{SUBJECT}", self.server).parse().unwrap()
+        format!("{}/{repository}@{SUBJECT}", self.server)
+            .parse()
+            .unwrap()
     }
 }
 

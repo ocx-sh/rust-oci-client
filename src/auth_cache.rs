@@ -68,7 +68,7 @@ impl ChallengeCache {
                 None => Arc::clone(hosts.entry(host.to_string()).or_default()),
             }
         };
-        cell.get_or_try_init(probe).await.map(Clone::clone)
+        cell.get_or_try_init(probe).await.cloned()
     }
 
     /// Installs `info` as `host`'s challenge without probing for it.
@@ -143,7 +143,7 @@ impl TokenFlights {
                 }
             }
         };
-        cell.get_or_try_init(exchange).await.map(Clone::clone)
+        cell.get_or_try_init(exchange).await.cloned()
     }
 }
 
