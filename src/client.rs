@@ -340,13 +340,26 @@ const MAX_REDIRECTS: usize = 10;
 /// Follows redirects like reqwest's default, except never from `https` to
 /// `http`.
 ///
-/// reqwest drops `Authorization` when a redirect changes host or port, but not
-/// when it changes only the scheme, so a registry on an explicit port answering
-/// `https://reg:8443/…` with `Location: http://reg:8443/…` keeps the bearer
-/// token and sends it in the clear (CWE-319). Redirects are load-bearing on the
-/// pull path — registries hand blobs off to CDNs that way — so refusing all of
-/// them (`Policy::none`) is not an option, and `https_only` would break
-/// registries deliberately configured as plain HTTP.
+/// reqwest already strips `Authorization` on a scheme-only change — its
+/// `cross_host` predicate compares scheme alongside host and port
+/// (`reqwest-0.13.4/src/redirect.rs:241-243`) — so the credential leak is not
+/// what this policy adds. It adds the other half: stripping a header is a
+/// *header* mitigation and the request still goes, so the URL, the request
+/// body, and the manifest or blob bytes travel to the plaintext target in the
+/// clear (CWE-319 on the request itself, not only CWE-522 on the header).
+/// Refusing the hop means nothing reaches that target at all.
+///
+/// The `redirect.rs` claim is version-dependent: reqwest 0.12's predicate has
+/// only the host and port terms, and a future version could drop the scheme
+/// term again. Re-check it on a reqwest bump rather than trusting this comment
+/// — if it ever regresses, the credential leak returns and this policy becomes
+/// the only thing closing it.
+///
+/// Redirects are load-bearing on the pull path — registries hand blobs off to
+/// CDNs that way — so refusing all of them (`Policy::none`) is not an option
+/// here, and `https_only` would break registries deliberately configured as
+/// plain HTTP. The upload path is the exception and does use `Policy::none`:
+/// see [`RequestBuilderWrapper::from_client_no_redirect`].
 fn no_scheme_downgrade_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if is_scheme_downgrade(attempt.previous().last(), attempt.url()) {
