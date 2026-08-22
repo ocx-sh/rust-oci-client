@@ -106,18 +106,21 @@ async fn commit_session() -> Response {
         .into_response()
 }
 
-/// Hands the caller a foreign host and a same-host session, then answers the
-/// upload request named by `route` with a `307` onto the foreign host.
+/// Answers with `status` and a `Location` onto the foreign host.
 ///
-/// `307` is the shape that matters: tower's redirect layer takes the original
-/// body on the first hop regardless of whether it can be cloned, so a followed
-/// `307` replays the blob to whatever the `Location` names.
-fn redirect_to(target: String) -> impl Fn() -> std::future::Ready<Response> + Clone {
-    move || {
-        std::future::ready(
-            (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, target.clone())]).into_response(),
-        )
-    }
+/// Which redirect status a case uses is not cosmetic. tower-http retains only a
+/// *clone* of the request body across a hop, so a `307` on a body reqwest
+/// cannot clone — a streamed upload — is never followed no matter what the
+/// policy says, and a test written that way would pass on reqwest's limitation
+/// instead of on this crate's guard. `303` is followed for any body (it drops
+/// the body and switches to `GET`), so it is the shape that discriminates
+/// there. Cases with a cloneable body use `307`, which replays the blob itself
+/// and is therefore the worse outcome to prove closed.
+fn redirect_to(
+    status: StatusCode,
+    target: String,
+) -> impl Fn() -> std::future::Ready<Response> + Clone {
+    move || std::future::ready((status, [(LOCATION, target.clone())]).into_response())
 }
 
 fn client(monolithic: bool) -> Client {
@@ -346,7 +349,8 @@ async fn a_malformed_upload_location_is_an_error_not_a_panic() {
 /// This is the second hop the string check cannot see. Every case must leave
 /// the foreign host untouched and surface the `307` as a status.
 async fn push_against_a_redirecting_registry(
-    build: impl FnOnce(String) -> Router + Send + 'static,
+    status: StatusCode,
+    build: impl FnOnce(StatusCode, String) -> Router + Send + 'static,
     push: impl AsyncFnOnce(Client, Reference) -> OciDistributionError,
     monolithic: bool,
 ) {
@@ -358,7 +362,7 @@ async fn push_against_a_redirecting_registry(
     .await;
 
     let elsewhere = format!("http://{}/v2/testrepo/blobs/uploads/1", foreign.authority);
-    let registry = Server::spawn(move |_| build(elsewhere)).await;
+    let registry = Server::spawn(move |_| build(status, elsewhere)).await;
 
     let reference = Reference::try_from(format!("{}/testrepo:latest", registry.authority)).unwrap();
     let error = push(client(monolithic), reference).await;
@@ -369,8 +373,8 @@ async fn push_against_a_redirecting_registry(
         "the redirect was followed onto the foreign host {sightings:?}"
     );
     assert!(
-        matches!(error, OciDistributionError::ServerError { code: 307, .. }),
-        "expected the 307 to surface as a status, got {error:?}"
+        matches!(error, OciDistributionError::ServerError { code, .. } if code == status.as_u16()),
+        "expected the {status} to surface as a status, got {error:?}"
     );
 }
 
@@ -378,11 +382,12 @@ async fn push_against_a_redirecting_registry(
 #[tokio::test]
 async fn a_chunk_patch_does_not_follow_a_redirect_off_the_registry() {
     push_against_a_redirecting_registry(
-        |elsewhere| {
+        StatusCode::TEMPORARY_REDIRECT,
+        |status, elsewhere| {
             Router::new()
                 .route(
                     "/v2/testrepo/blobs/uploads/1",
-                    patch(redirect_to(elsewhere)),
+                    patch(redirect_to(status, elsewhere)),
                 )
                 .route("/v2/testrepo/blobs/uploads/", post(open_session))
                 .with_state("/v2/testrepo/blobs/uploads/1".to_string())
@@ -402,11 +407,12 @@ async fn a_chunk_patch_does_not_follow_a_redirect_off_the_registry() {
 #[tokio::test]
 async fn the_commit_put_does_not_follow_a_redirect_off_the_registry() {
     push_against_a_redirecting_registry(
-        |elsewhere| {
+        StatusCode::TEMPORARY_REDIRECT,
+        |status, elsewhere| {
             Router::new()
                 .route(
                     "/v2/testrepo/blobs/uploads/1",
-                    patch(accept_chunk).put(redirect_to(elsewhere)),
+                    patch(accept_chunk).put(redirect_to(status, elsewhere)),
                 )
                 .route("/v2/testrepo/blobs/uploads/", post(open_session))
                 .with_state("/v2/testrepo/blobs/uploads/1".to_string())
@@ -427,9 +433,13 @@ async fn the_commit_put_does_not_follow_a_redirect_off_the_registry() {
 #[tokio::test]
 async fn a_monolithic_put_does_not_follow_a_redirect_off_the_registry() {
     push_against_a_redirecting_registry(
-        |elsewhere| {
+        StatusCode::TEMPORARY_REDIRECT,
+        |status, elsewhere| {
             Router::new()
-                .route("/v2/testrepo/blobs/uploads/1", put(redirect_to(elsewhere)))
+                .route(
+                    "/v2/testrepo/blobs/uploads/1",
+                    put(redirect_to(status, elsewhere)),
+                )
                 .route("/v2/testrepo/blobs/uploads/", post(open_session))
                 .with_state("/v2/testrepo/blobs/uploads/1".to_string())
         },
@@ -448,9 +458,13 @@ async fn a_monolithic_put_does_not_follow_a_redirect_off_the_registry() {
 #[tokio::test]
 async fn a_streamed_monolithic_put_does_not_follow_a_redirect_off_the_registry() {
     push_against_a_redirecting_registry(
-        |elsewhere| {
+        StatusCode::SEE_OTHER,
+        |status, elsewhere| {
             Router::new()
-                .route("/v2/testrepo/blobs/uploads/1", put(redirect_to(elsewhere)))
+                .route(
+                    "/v2/testrepo/blobs/uploads/1",
+                    put(redirect_to(status, elsewhere)),
+                )
                 .route("/v2/testrepo/blobs/uploads/", post(open_session))
                 .with_state("/v2/testrepo/blobs/uploads/1".to_string())
         },
