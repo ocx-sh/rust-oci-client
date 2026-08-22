@@ -614,8 +614,12 @@ mod test {
             architecture: architecture.into(),
             os: os.into(),
             os_version: None,
-            os_features: os_features
-                .map(|features| features.iter().map(|feature| (*feature).to_string()).collect()),
+            os_features: os_features.map(|features| {
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_string())
+                    .collect()
+            }),
             variant: variant.map(str::to_string),
             features: None,
         }
