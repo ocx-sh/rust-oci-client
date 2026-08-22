@@ -4,6 +4,7 @@
 use sha2::Digest;
 
 pub mod annotations;
+pub(crate) mod auth_cache;
 mod blob;
 pub mod client;
 pub mod config;

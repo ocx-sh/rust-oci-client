@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, trace, warn};
 
+use crate::auth_cache::{ChallengeCache, ChallengeInfo, TokenFlights};
 pub use crate::blob::*;
 use crate::config::ConfigFile;
 use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
@@ -35,7 +36,9 @@ use crate::manifest::{
 use crate::secrets::RegistryAuth;
 use crate::secrets::*;
 use crate::sha256_digest;
-use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::token_cache::{
+    RegistryOperation, RegistryToken, RegistryTokenType, TokenCache, TokenCacheKey,
+};
 use crate::Reference;
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
@@ -292,6 +295,13 @@ pub struct Client {
     auth_store: Arc<RwLock<HashMap<String, RegistryAuth>>>,
     /// Token cache for the client
     pub tokens: TokenCache,
+    // Host -> the `WWW-Authenticate` challenge `GET /v2/` answered with. Probed
+    // once per host rather than once per repository, and dropped wholesale when
+    // a `401` says what is cached for that host is stale.
+    challenges: Arc<ChallengeCache>,
+    // Token exchanges currently running, so N cold callers for one scope share
+    // one handshake instead of each running their own.
+    token_flights: Arc<TokenFlights>,
     client: reqwest::Client,
     push_chunk_size: usize,
 }
@@ -302,6 +312,8 @@ impl Default for Client {
             config: Arc::default(),
             auth_store: Arc::default(),
             tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
+            challenges: Arc::default(),
+            token_flights: Arc::default(),
             client: default_seeded_client(),
             push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
         }
@@ -417,6 +429,8 @@ impl TryFrom<ClientConfig> for Client {
         Ok(Self {
             config: Arc::new(config),
             tokens: TokenCache::new(default_token_expiration_secs),
+            challenges: Arc::default(),
+            token_flights: Arc::default(),
             client: client_builder.build()?,
             push_chunk_size,
             // Explicit `auth_store` rather than `..Default::default()`: the
@@ -495,11 +509,7 @@ impl Client {
         let auth = self.auth_store.read().await.get(registry)?.clone();
         match self.tokens.get(reference, op).await {
             Some(token) => Some(token),
-            None => {
-                let token = self._auth(reference, &auth, op).await.ok()??;
-                self.tokens.insert(reference, op, token.clone()).await;
-                Some(token)
-            }
+            None => self.acquire_token(reference, &auth, op).await.ok()?,
         }
     }
 
@@ -535,12 +545,7 @@ impl Client {
             client: self,
             request_builder: request,
         };
-        let res = request
-            .apply_auth(image, op)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res = request.send_authed(image, op).await?;
         let status = res.status();
         let body = res.bytes().await?;
 
@@ -616,11 +621,7 @@ impl Client {
     /// `Content-Length` — callers rely on a known size to build a
     /// valid OCI descriptor, and silently falling back to zero would
     /// corrupt the manifest.
-    pub async fn fetch_blob_size(
-        &self,
-        image: &Reference,
-        digest: &str,
-    ) -> Result<Option<u64>> {
+    pub async fn fetch_blob_size(&self, image: &Reference, digest: &str) -> Result<Option<u64>> {
         let Some(res) = self.head_blob_response(image, digest).await? else {
             return Ok(None);
         };
@@ -633,9 +634,7 @@ impl Client {
                 ))
             })?;
         let header_str = header.to_str().map_err(|e| {
-            OciDistributionError::GenericError(Some(format!(
-                "invalid Content-Length header: {e}"
-            )))
+            OciDistributionError::GenericError(Some(format!("invalid Content-Length header: {e}")))
         })?;
         let content_length = header_str.parse::<u64>().map_err(|e| {
             OciDistributionError::GenericError(Some(format!(
@@ -659,12 +658,7 @@ impl Client {
             request_builder: self.client.head(&url),
         };
 
-        let res = request
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res = request.send_authed(image, RegistryOperation::Pull).await?;
 
         match res.error_for_status_ref() {
             Ok(_) => Ok(Some(res)),
@@ -891,6 +885,22 @@ impl Client {
     ///
     /// This performs authorization and then stores the token internally to be used
     /// on other requests.
+    /// # Caching
+    ///
+    /// A live cached token for `(registry, repository, operation)` answers
+    /// without a single request. The [`store_auth_if_needed`] call above it is
+    /// **not** part of that shortcut and runs either way: it is the side effect
+    /// a later `apply_auth` reads to decide whether the request is
+    /// authenticated at all, so an early return placed before it makes a
+    /// cache-resolved pull go out anonymous and come back `401`.
+    ///
+    /// [`RegistryAuth::Bearer`] is excluded from the shortcut. `_auth` returns
+    /// the caller-supplied token without any request, so the cache saves
+    /// nothing there — while this is the only route by which a *rotated* bearer
+    /// token replaces the cached one, and short-circuiting would keep serving
+    /// the stale token until its recorded expiry.
+    ///
+    /// [`store_auth_if_needed`]: Client::store_auth_if_needed
     pub async fn auth(
         &self,
         image: &Reference,
@@ -899,27 +909,84 @@ impl Client {
     ) -> Result<Option<String>> {
         self.store_auth_if_needed(image.resolve_registry(), authentication)
             .await;
-        // preserve old caching behavior
-        match self._auth(image, authentication, operation).await {
-            Ok(Some(RegistryTokenType::Bearer(token))) => {
-                self.tokens
-                    .insert(image, operation, RegistryTokenType::Bearer(token.clone()))
-                    .await;
-                Ok(Some(token.token().to_string()))
+
+        if !matches!(authentication, RegistryAuth::Bearer(_)) {
+            if let Some(token) = self.tokens.get(image, operation).await {
+                return Ok(bearer_value(&token));
             }
-            Ok(Some(RegistryTokenType::Basic(username, password))) => {
-                self.tokens
-                    .insert(
-                        image,
-                        operation,
-                        RegistryTokenType::Basic(username, password),
-                    )
-                    .await;
-                Ok(None)
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
         }
+
+        let token = self.acquire_token(image, authentication, operation).await?;
+        Ok(token.as_ref().and_then(bearer_value))
+    }
+
+    /// Runs the authentication handshake and caches what it yields, coalescing
+    /// concurrent cold callers on `(registry, repository, operation)`.
+    ///
+    /// This pair — the handshake and the cache write — is the unit that must be
+    /// coalesced. A refresh of an index or a multi-layer pull enters here N-wide
+    /// and cold, and every caller misses the token cache before any of them has
+    /// finished writing to it.
+    async fn acquire_token(
+        &self,
+        image: &Reference,
+        authentication: &RegistryAuth,
+        operation: RegistryOperation,
+    ) -> Result<Option<RegistryTokenType>> {
+        let key = TokenCacheKey::new(image, operation);
+        self.token_flights
+            .acquire(key, || async {
+                let token = self._auth(image, authentication, operation).await?;
+                if let Some(token) = &token {
+                    self.tokens.insert(image, operation, token.clone()).await;
+                }
+                Ok(token)
+            })
+            .await
+    }
+
+    /// Forgets everything cached about `registry`'s authentication — the
+    /// challenge probe and every scoped token under it.
+    ///
+    /// containerd's `invalidAuthorization`, and the reason caching the probe is
+    /// safe: a `401` whose challenge names an `error` rebuilds the host from
+    /// scratch, so a cached challenge cannot go on suppressing a legitimate
+    /// later rejection.
+    async fn invalidate_auth(&self, registry: &str) {
+        self.challenges.purge(registry);
+        self.tokens.purge_registry(registry).await;
+    }
+
+    /// The `WWW-Authenticate` challenge this host answers `GET /v2/` with,
+    /// probed once per host and shared by every repository under it.
+    ///
+    /// The probe URL is built from the registry alone, so its answer never
+    /// depended on the repository; caching it per host is what takes a
+    /// P-package sync from P probes to one. Staleness is handled by
+    /// [`invalidate_auth`](Client::invalidate_auth), not by re-probing.
+    async fn challenge_for(&self, registry: &str) -> Result<ChallengeInfo> {
+        // The version request will tell us where to go.
+        let url = format!(
+            "{}://{}/v2/",
+            self.config.protocol.scheme_for(registry),
+            registry
+        );
+        self.challenges
+            .get_or_probe(registry, || async {
+                debug!(?url, "Probing for an authentication challenge");
+                let res = self.client.get(&url).send().await?;
+                let Some(dist_hdr) = res.headers().get(reqwest::header::WWW_AUTHENTICATE) else {
+                    return Ok(ChallengeInfo::Unchallenged);
+                };
+                Ok(match BearerChallenge::try_from(dist_hdr) {
+                    Ok(challenge) => ChallengeInfo::Bearer(challenge),
+                    Err(e) => {
+                        debug!(error = ?e, "Falling back to HTTP Basic Auth");
+                        ChallengeInfo::Unsupported
+                    }
+                })
+            })
+            .await
     }
 
     /// Internal auth that retrieves token.
@@ -930,13 +997,6 @@ impl Client {
         operation: RegistryOperation,
     ) -> Result<Option<RegistryTokenType>> {
         debug!("Authorizing for image: {:?}", image);
-        // The version request will tell us where to go.
-        let url = format!(
-            "{}://{}/v2/",
-            self.config.protocol.scheme_for(image.resolve_registry()),
-            image.resolve_registry()
-        );
-        debug!(?url);
 
         if let RegistryAuth::Bearer(token) = authentication {
             return Ok(Some(RegistryTokenType::Bearer(RegistryToken::Token {
@@ -944,24 +1004,21 @@ impl Client {
             })));
         }
 
-        let res = self.client.get(&url).send().await?;
-        let dist_hdr = match res.headers().get(reqwest::header::WWW_AUTHENTICATE) {
-            Some(h) => h,
-            None => return Ok(None),
+        let basic_fallback = || match authentication {
+            RegistryAuth::Basic(username, password) => Ok(Some(RegistryTokenType::Basic(
+                username.to_string(),
+                password.to_string(),
+            ))),
+            _ => Ok(None),
         };
 
-        let challenge = match BearerChallenge::try_from(dist_hdr) {
-            Ok(c) => c,
-            Err(e) => {
-                debug!(error = ?e, "Falling back to HTTP Basic Auth");
-                if let RegistryAuth::Basic(username, password) = authentication {
-                    return Ok(Some(RegistryTokenType::Basic(
-                        username.to_string(),
-                        password.to_string(),
-                    )));
-                }
-                return Ok(None);
-            }
+        let challenge = match self.challenge_for(image.resolve_registry()).await? {
+            ChallengeInfo::Bearer(challenge) => challenge,
+            // No challenge at all: nothing to exchange, and Basic credentials
+            // stay unused rather than being volunteered to a host that never
+            // asked for them — the pre-cache behaviour, unchanged.
+            ChallengeInfo::Unchallenged => return Ok(None),
+            ChallengeInfo::Unsupported => return basic_fallback(),
         };
 
         // Allow for either push or pull authentication
@@ -1039,10 +1096,7 @@ impl Client {
         debug!("HEAD image manifest from {}", url);
         let res = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
+            .send_authed(image, RegistryOperation::Pull)
             .await?;
 
         if let Some(digest) = digest_header_value(res.headers().clone())? {
@@ -1071,10 +1125,7 @@ impl Client {
             debug!("GET image manifest from {}", url);
             let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
                 .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                .apply_auth(image, RegistryOperation::Pull)
-                .await?
-                .into_request_builder()
-                .send()
+                .send_authed(image, RegistryOperation::Pull)
                 .await?;
             let status = res.status();
             trace!(headers = ?res.headers(), "Got Headers");
@@ -1275,10 +1326,7 @@ impl Client {
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(accepted_media_types)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
+            .send_authed(image, RegistryOperation::Pull)
             .await?;
         let status = res.status();
         let headers = res.headers().clone();
@@ -2067,10 +2115,7 @@ impl Client {
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
+            .send_authed(image, RegistryOperation::Pull)
             .await?;
         let status = res.status();
         let body = res.bytes().await?;
@@ -2116,10 +2161,7 @@ impl Client {
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
+            .send_authed(image, RegistryOperation::Pull)
             .await?;
         let status = res.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -2251,12 +2293,7 @@ impl Client {
             client: self,
             request_builder: request,
         };
-        let res = request
-            .apply_auth(image, op)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res = request.send_authed(image, op).await?;
         let status = res.status();
         let body = res.bytes().await?;
 
@@ -2752,9 +2789,39 @@ impl AsyncRead for SharedReader {
         // Recover from a poisoned lock rather than panic across the `AsyncRead`
         // boundary: poisoning means a wrapped reader panicked mid-poll, but the
         // reader value itself is intact, so continue with it.
-        let mut reader = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut reader = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         reader.as_mut().poll_read(cx, buf)
     }
+}
+
+/// What [`Client::auth`] reports to its caller: the bearer token, or `None`
+/// for Basic credentials, which the caller already holds.
+fn bearer_value(token: &RegistryTokenType) -> Option<String> {
+    match token {
+        RegistryTokenType::Bearer(token) => Some(token.token().to_string()),
+        RegistryTokenType::Basic(..) => None,
+    }
+}
+
+/// True when a `WWW-Authenticate` header carries an `error` parameter.
+///
+/// containerd treats exactly this as "what I cached for this host is no longer
+/// valid" rather than invalidating on every `401`: a `401` with a plain
+/// challenge is a request that arrived unauthenticated, while `error=` names a
+/// credential or token the registry has actively rejected.
+fn challenge_carries_error(header: &HeaderValue) -> bool {
+    let Ok(value) = header.to_str() else {
+        return false;
+    };
+    ChallengeParser::new(value).flatten().any(|challenge| {
+        challenge
+            .params
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("error"))
+    })
 }
 
 /// The request builder wrapper allows to be instantiated from a
@@ -2857,6 +2924,56 @@ impl<'a> RequestBuilderWrapper<'a> {
         })
     }
 
+    /// Applies auth, sends, and on a `401` carrying a challenge refreshes the
+    /// token and retries **once**.
+    ///
+    /// The compensating control for a cached token that aged out between the
+    /// cache's renewal margin and what the registry actually honours: the
+    /// margin makes that window small, this makes falling into it survivable.
+    /// A second consecutive `401` is returned as it stands — an authentication
+    /// failure, not a retry loop.
+    ///
+    /// Scoped to the request builders that carry no body, which is every read
+    /// path here: the retry re-sends by cloning the builder, and a streaming
+    /// body cannot be cloned.
+    async fn send_authed(&self, image: &Reference, op: RegistryOperation) -> Result<Response> {
+        let res = self
+            .apply_auth(image, op)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        if res.status() != StatusCode::UNAUTHORIZED {
+            return Ok(res);
+        }
+        let Some(header) = res.headers().get(reqwest::header::WWW_AUTHENTICATE) else {
+            // A `401` with nothing to act on: no challenge to re-derive and no
+            // scope to re-request, so a retry would send the same request again.
+            return Ok(res);
+        };
+
+        let registry = image.resolve_registry();
+        if challenge_carries_error(header) {
+            self.client.invalidate_auth(registry).await;
+        } else {
+            self.client.tokens.invalidate(image, op).await;
+        }
+
+        let Some(authentication) = self.client.auth_store.read().await.get(registry).cloned()
+        else {
+            // Nothing was ever stored for this registry, so the request went out
+            // anonymous and re-authenticating would change nothing.
+            return Ok(res);
+        };
+        debug!(%registry, "Re-authenticating after a 401 and retrying once");
+        self.client.auth(image, &authentication, op).await?;
+        self.apply_auth(image, op)
+            .await?
+            .into_request_builder()
+            .send()
+            .await
+            .map_err(Into::into)
+    }
 }
 
 /// The encoding of the certificate
@@ -3133,7 +3250,7 @@ impl ClientProtocol {
 }
 
 #[derive(Clone, Debug)]
-struct BearerChallenge {
+pub(crate) struct BearerChallenge {
     pub realm: Box<str>,
     pub service: Option<String>,
 }

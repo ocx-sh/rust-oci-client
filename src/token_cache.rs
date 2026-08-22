@@ -66,7 +66,7 @@ impl RegistryToken {
 }
 
 /// Desired operation for registry authentication
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RegistryOperation {
     /// Authenticate for push operations
     Push,
@@ -79,11 +79,40 @@ struct BearerTokenClaims {
     exp: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct TokenCacheKey {
+/// Identity of one cached token: a registry, a repository under it, and the
+/// operation the token was scoped for.
+///
+/// # The key carries no credential identity, and that is only safe by accident
+///
+/// If two different [`RegistryAuth`](crate::secrets::RegistryAuth) values were
+/// ever live for one key concurrently, a coalesced waiter could receive a token
+/// minted for someone else's credentials. It cannot happen today because
+/// `Client::store_auth_if_needed` is first-write-wins per registry and never
+/// overwrites for the life of a `Client`, so one client holds at most one
+/// identity per registry. A change to `store_auth` that allowed credential
+/// rotation would reopen this, and nothing else in the crate would catch it —
+/// such a change must add the credential to this key.
+///
+/// # The scope must stay in the key
+///
+/// Registry **and** repository **and** verb set. Keying on the registry alone
+/// is the `insufficient_scope` bug class (moby/buildkit#5883): a token minted
+/// for one repository is served for another the registry never granted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TokenCacheKey {
     registry: String,
     repository: String,
     operation: RegistryOperation,
+}
+
+impl TokenCacheKey {
+    pub(crate) fn new(reference: &Reference, operation: RegistryOperation) -> Self {
+        TokenCacheKey {
+            registry: reference.resolve_registry().to_string(),
+            repository: reference.repository().to_string(),
+            operation,
+        }
+    }
 }
 
 struct TokenCacheValue {
@@ -124,17 +153,35 @@ impl TokenCache {
                 }
             }
         };
-        let registry = reference.resolve_registry().to_string();
-        let repository = reference.repository().to_string();
-        debug!(%registry, %repository, ?op, %expiration, "Inserting token");
-        self.tokens.write().await.insert(
-            TokenCacheKey {
-                registry,
-                repository,
-                operation: op,
-            },
-            TokenCacheValue { token, expiration },
-        );
+        let key = TokenCacheKey::new(reference, op);
+        debug!(%key.registry, %key.repository, ?op, %expiration, "Inserting token");
+        self.tokens
+            .write()
+            .await
+            .insert(key, TokenCacheValue { token, expiration });
+    }
+
+    /// Drops the entry for one `(registry, repository, operation)` key.
+    ///
+    /// Called when the registry answers a request the cached token authorised
+    /// with `401`: the entry outlived what the registry will honour, and
+    /// keeping it would make the retry send the same rejected token again.
+    pub(crate) async fn invalidate(&self, reference: &Reference, op: RegistryOperation) {
+        let key = TokenCacheKey::new(reference, op);
+        self.tokens.write().await.remove(&key);
+    }
+
+    /// Drops every entry belonging to `registry`, whatever the repository or
+    /// operation.
+    ///
+    /// The token half of containerd's `invalidAuthorization`: a `401` whose
+    /// challenge names an `error` invalidates everything remembered about the
+    /// host, not just the one scope that was rejected.
+    pub(crate) async fn purge_registry(&self, registry: &str) {
+        self.tokens
+            .write()
+            .await
+            .retain(|key, _| key.registry != registry);
     }
 
     pub(crate) async fn get(
@@ -142,24 +189,13 @@ impl TokenCache {
         reference: &Reference,
         op: RegistryOperation,
     ) -> Option<RegistryTokenType> {
-        let registry = reference.resolve_registry().to_string();
-        let repository = reference.repository().to_string();
-        let key = TokenCacheKey {
-            registry,
-            repository,
-            operation: op,
-        };
+        let key = TokenCacheKey::new(reference, op);
         match self.tokens.read().await.get(&key) {
             Some(TokenCacheValue {
                 ref token,
                 expiration,
             }) => {
-                let now = SystemTime::now();
-                let epoch = now
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards")
-                    .as_secs();
-                if epoch > *expiration {
+                if !is_live(*expiration, now_epoch_secs()) {
                     debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=true, "Fetching token");
                     None
                 } else {
@@ -175,6 +211,40 @@ impl TokenCache {
     }
 }
 
+/// Seconds since the Unix epoch, or `None` when the wall clock reads behind it.
+///
+/// A backwards clock step is precisely the condition an expiry cache is exposed
+/// to, and library code must not panic on it. Every caller reads `None` as
+/// "expired" or "do not cache", which re-authenticates — the fail-safe
+/// direction.
+fn now_epoch_secs() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs())
+}
+
+/// Whether a cached entry is still usable at `now`.
+///
+/// Inside the renewal margin counts as expired, and so does a `now` of `None` —
+/// a clock that has stepped behind the epoch. Both resolve to
+/// "re-authenticate", which is the safe direction: the cost of a spurious miss
+/// is one handshake, the cost of a spurious hit is a request that arrives with
+/// a token the registry has already stopped honouring.
+fn is_live(expiration: u64, now: Option<u64>) -> bool {
+    now.is_some_and(|epoch| epoch <= expiration.saturating_sub(RENEWAL_MARGIN_SECS))
+}
+
+/// Grace period subtracted from every cached token's recorded expiry.
+///
+/// The Docker token spec's floor is 60 s, and `DEFAULT_TOKEN_EXPIRATION_SECS`
+/// takes it literally, so an entry can pass a bare `now <= expiration` check
+/// with a fraction of a second of validity left and authorise a request that
+/// arrives expired. That was masked while `Client::auth` minted a fresh token
+/// on every call; the cache-first path removed the accidental refresh, so the
+/// margin arrives with it.
+const RENEWAL_MARGIN_SECS: u64 = 30;
+
 fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) -> Option<u64> {
     match jsonwebtoken::dangerous::insecure_decode::<BearerTokenClaims>(token_str) {
         Ok(token) => {
@@ -189,12 +259,7 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
                     // > that it will remain valid. When omitted, this defaults to 60 seconds.
                     // > For compatibility with older clients, a token should never be returned
                     // > with less than 60 seconds to live.
-                    let now = SystemTime::now();
-                    let epoch = now
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Time went backwards")
-                        .as_secs();
-                    let expiration = epoch + default_expiration_secs as u64;
+                    let expiration = now_epoch_secs()? + default_expiration_secs as u64;
                     debug!("Cannot extract expiration from token's claims, assuming a {} seconds validity", default_expiration_secs);
                     expiration
                 }
@@ -206,10 +271,7 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
             // The token is not a JWT (e.g., an opaque token issued by registries
             // like GHCR). Use the default expiration as a best-effort assumption,
             // mirroring the behaviour for JWT tokens that carry no `exp` claim.
-            let epoch = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_secs();
+            let epoch = now_epoch_secs()?;
             debug!(
                 "Bearer token is not a JWT, assuming a {} seconds validity",
                 default_expiration_secs
@@ -302,6 +364,45 @@ mod tests {
             .as_secs();
         assert!(exp >= before + 60);
         assert!(exp <= after + 60);
+    }
+
+    /// C-029, both halves. One alone cannot tell a working renewal margin from
+    /// a cache that never hits at all.
+    #[test]
+    fn an_entry_inside_the_renewal_margin_is_a_miss() {
+        let now = 1_000_000u64;
+
+        assert!(
+            !is_live(now + 1, Some(now)),
+            "a token with one second of validity left must not authorise a request"
+        );
+        assert!(
+            !is_live(now + RENEWAL_MARGIN_SECS - 1, Some(now)),
+            "one second inside the margin is still a miss"
+        );
+        assert!(
+            is_live(now + RENEWAL_MARGIN_SECS, Some(now)),
+            "exactly the margin's worth of validity is the boundary, and it is live"
+        );
+        assert!(
+            is_live(now + 600, Some(now)),
+            "a token ten minutes from expiry must be served from the cache"
+        );
+        assert!(
+            is_live(u64::MAX, Some(now)),
+            "Basic credentials never expire, and the margin must not underflow them"
+        );
+    }
+
+    /// A clock that has stepped behind the Unix epoch resolves to "expired" and
+    /// re-authenticates. Before this it panicked — `.expect("Time went
+    /// backwards")` — from library code, on the path every `auth()` now takes.
+    #[test]
+    fn a_backwards_clock_expires_rather_than_panics() {
+        assert!(
+            !is_live(u64::MAX, None),
+            "an unreadable clock must fail safe to expired, even for a never-expiring entry"
+        );
     }
 
     #[tokio::test]
