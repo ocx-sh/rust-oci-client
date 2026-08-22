@@ -1,3 +1,12 @@
+# Standalone workspace root. Without it, `cargo` walking up from this manifest
+# lands on the parent repository's workspace: its `exclude` names
+# `external/rust-oci-client` relative to its own root, which does not cover a
+# copy of this submodule checked out under a git worktree — so every cargo
+# invocation from inside one failed with "current package believes it's in a
+# workspace when it's not", and this crate's own test suite could not be run
+# there at all.
+[workspace]
+
 [package]
 authors = [
   "Matt Butcher <matt.butcher@microsoft.com>",
