@@ -945,25 +945,14 @@ impl Client {
             .await
     }
 
-    /// Forgets everything cached about `registry`'s authentication — the
-    /// challenge probe and every scoped token under it.
-    ///
-    /// containerd's `invalidAuthorization`, and the reason caching the probe is
-    /// safe: a `401` whose challenge names an `error` rebuilds the host from
-    /// scratch, so a cached challenge cannot go on suppressing a legitimate
-    /// later rejection.
-    async fn invalidate_auth(&self, registry: &str) {
-        self.challenges.purge(registry);
-        self.tokens.purge_registry(registry).await;
-    }
-
     /// The `WWW-Authenticate` challenge this host answers `GET /v2/` with,
     /// probed once per host and shared by every repository under it.
     ///
     /// The probe URL is built from the registry alone, so its answer never
     /// depended on the repository; caching it per host is what takes a
-    /// P-package sync from P probes to one. Staleness is handled by
-    /// [`invalidate_auth`](Client::invalidate_auth), not by re-probing.
+    /// P-package sync from P probes to one. Staleness is handled by the `401`
+    /// path in `send_authed`, which drops the cached challenge and reseeds it
+    /// from the rejection's own header, not by re-probing.
     async fn challenge_for(&self, registry: &str) -> Result<ChallengeInfo> {
         // The version request will tell us where to go.
         let url = format!(
@@ -2942,15 +2931,26 @@ impl<'a> RequestBuilderWrapper<'a> {
             return Ok(res);
         };
 
-        // Everything cached for this host is now suspect, not just the scope
-        // that was rejected: a registry that has *revoked* a token commonly
-        // refuses it with a plain `Bearer` challenge and no `error` parameter,
-        // so narrowing the purge to `error=` leaves the revoked token in place
-        // and the retry sends it again. The second-`401` rule below is what
-        // makes the wider trigger safe.
+        // Drop the rejected scope's token, and only that one. A registry that
+        // has *revoked* a token commonly refuses it with a plain `Bearer`
+        // challenge and no `error` parameter, so this response cannot tell a
+        // refused scope from a dead credential — but nor is that a reason to
+        // charge every other scope under the host a fresh token exchange on
+        // the guess. One forbidden repository inside a 512-wide index fan-out
+        // would re-mint the other 511.
+        //
+        // The wide purge is deferred, not abandoned: the retry below is the
+        // experiment that separates the two cases, and a `401` that survives a
+        // freshly minted token escalates to `purge_registry`.
+        //
+        // The cached *challenge* is dropped unconditionally and reseeded from
+        // this rejection's own header — it is a realm, not a credential, and
+        // refreshing it from the live response is what stops a cached probe
+        // suppressing a legitimate later `401`.
         let registry = image.resolve_registry();
         let challenge = BearerChallenge::try_from(header).ok();
-        self.client.invalidate_auth(registry).await;
+        self.client.challenges.purge(registry);
+        self.client.tokens.purge_scope(image, op).await;
         if let Some(challenge) = challenge {
             // The rejection carried the challenge the retry needs, so seed it
             // rather than paying a `GET /v2/` to ask the host for it again.
@@ -2967,12 +2967,23 @@ impl<'a> RequestBuilderWrapper<'a> {
         };
         debug!(%registry, "Re-authenticating after a 401 and retrying once");
         self.client.auth(image, &authentication, op).await?;
-        self.apply_auth(image, op)
+        let retried = self
+            .apply_auth(image, op)
             .await?
             .into_request_builder()
             .send()
-            .await
-            .map_err(Into::into)
+            .await?;
+        if retried.status() == StatusCode::UNAUTHORIZED {
+            // A token minted seconds ago was refused too, so what is dead is
+            // the credential behind every scope under this host, not the one
+            // scope that was rejected — containerd's `invalidAuthorization`.
+            // Purging now stops a sibling repository sending a token minted
+            // from the same credential until it expires.
+            //
+            // Terminal all the same: this response is returned as it stands.
+            self.client.tokens.purge_registry(registry).await;
+        }
+        Ok(retried)
     }
 }
 

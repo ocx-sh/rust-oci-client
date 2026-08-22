@@ -170,12 +170,33 @@ impl TokenCache {
             .insert(key, TokenCacheValue { token, expiration });
     }
 
+    /// Drops the one entry for `reference`'s registry, repository and `op`.
+    ///
+    /// The scope named by a `401` is the only one the rejection is evidence
+    /// about. Dropping the host with it costs a fresh token exchange for every
+    /// sibling scope in flight — inside a wide index fan-out, one forbidden
+    /// repository would re-mint every authorised one — so the wide purge waits
+    /// for evidence the credential itself is dead. See
+    /// [`purge_registry`](Self::purge_registry).
+    pub(crate) async fn purge_scope(&self, reference: &Reference, op: RegistryOperation) {
+        let key = TokenCacheKey::new(reference, op);
+        debug!(%key.registry, %key.repository, ?op, "Purging token");
+        self.tokens.write().await.remove(&key);
+    }
+
     /// Drops every entry belonging to `registry`, whatever the repository or
     /// operation.
     ///
-    /// The token half of containerd's `invalidAuthorization`: a `401` whose
-    /// challenge names an `error` invalidates everything remembered about the
-    /// host, not just the one scope that was rejected.
+    /// The token half of containerd's `invalidAuthorization`, reached once a
+    /// *freshly minted* token has been refused as well: at that point what is
+    /// dead is the credential every scope under the host was minted from, not
+    /// the one scope that was rejected, and a sibling still holding such a
+    /// token would go on sending it until expiry.
+    ///
+    /// A plain `Bearer` challenge is why this cannot fire on the first `401`:
+    /// it carries no `error` parameter, so the rejection alone does not
+    /// separate a refused scope from a revoked credential. Surviving a retry
+    /// with a new token does.
     pub(crate) async fn purge_registry(&self, registry: &str) {
         self.tokens
             .write()

@@ -683,13 +683,20 @@ async fn a_cached_probe_does_not_suppress_a_repository_401() {
     );
 }
 
-/// The `401` drops every scoped token under the host, not just the one that was
-/// rejected — containerd's `invalidAuthorization`, which deletes the whole
-/// handler. A registry that revokes one credential has usually revoked them
-/// all, and a sibling repository still holding a token minted from it would go
-/// on sending it until expiry.
+/// A `401` that survives a freshly minted token drops every scoped token under
+/// the host, not just the one that was rejected — containerd's
+/// `invalidAuthorization`, which deletes the whole handler. A registry that
+/// revokes one credential has usually revoked them all, and a sibling
+/// repository still holding a token minted from it would go on sending it until
+/// expiry.
+///
+/// The *terminal* `401` is the trigger, not the first one. A plain `Bearer`
+/// challenge carries no `error` parameter, so the first rejection cannot
+/// separate a refused scope from a revoked credential; a rejection that
+/// outlives a token minted seconds ago can. Until then the purge stays narrow —
+/// see `a_recovered_401_leaves_the_other_scopes_alone`.
 #[tokio::test]
-async fn a_401_purges_every_scoped_token_for_the_host() {
+async fn a_terminal_401_purges_every_scoped_token_for_the_host() {
     let registry = StubRegistry::start().await;
     let client = registry.client();
     let sibling = registry.reference("test/sibling");
@@ -705,15 +712,17 @@ async fn a_401_purges_every_scoped_token_for_the_host() {
         .unwrap();
     assert_eq!(registry.state.exchanges(), 2, "one exchange per repository");
 
-    registry.state.reject("test/rejected", 1);
+    // The retry is rejected too, which is what makes the credential — and so
+    // every token minted from it — suspect.
+    registry.state.reject("test/rejected", 10);
     client
         .list_tags(&rejected, &basic(), None, None)
         .await
-        .unwrap();
+        .expect_err("a repository that rejects the retry as well must fail");
     assert_eq!(
         registry.state.exchanges(),
         3,
-        "the rejected repository re-authenticates for its retry"
+        "the rejected repository re-authenticates for its one retry"
     );
 
     client
@@ -729,6 +738,54 @@ async fn a_401_purges_every_scoped_token_for_the_host() {
         registry.state.probes(),
         1,
         "the seeded challenge covers the whole host — no second probe"
+    );
+}
+
+/// A `401` the retry recovers from leaves every *other* scope's token alone.
+///
+/// The rejection is scoped: it is evidence about the repository it names and
+/// about nothing else under the host. Purging the host on it costs one fresh
+/// token exchange per sibling — a single forbidden repository inside a wide
+/// index fan-out re-mints every authorised one, O(N) exchanges for one `403`
+/// wearing a `401`'s clothes.
+#[tokio::test]
+async fn a_recovered_401_leaves_the_other_scopes_alone() {
+    let registry = StubRegistry::start().await;
+    let client = registry.client();
+    let sibling = registry.reference("test/sibling");
+    let rejected = registry.reference("test/rejected");
+
+    client
+        .list_tags(&sibling, &basic(), None, None)
+        .await
+        .unwrap();
+    client
+        .list_tags(&rejected, &basic(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(registry.state.exchanges(), 2, "one exchange per repository");
+
+    // One rejection only: the retry succeeds, so nothing casts doubt on the
+    // credential itself.
+    registry.state.reject("test/rejected", 1);
+    client
+        .list_tags(&rejected, &basic(), None, None)
+        .await
+        .expect("a 401 followed by a 200 must succeed");
+    assert_eq!(
+        registry.state.exchanges(),
+        3,
+        "the rejected scope re-mints its own token for the retry"
+    );
+
+    client
+        .list_tags(&sibling, &basic(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        registry.state.exchanges(),
+        3,
+        "the sibling was never rejected — its token must survive the retry"
     );
 }
 
