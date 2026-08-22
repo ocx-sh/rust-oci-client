@@ -1,9 +1,15 @@
 //! A blob upload must stay on the registry that opened the session.
 //!
-//! The unit tests in `client.rs` cover the guard itself; these cover the
-//! *wiring* — that the real push paths call it — by standing up two listeners
-//! and having the registry hand out an upload `Location` on the other one.
+//! The unit tests in `client.rs` cover the guards themselves; these cover the
+//! *wiring* — that the real push paths call them — by standing up two listeners
+//! and having the registry try to move the upload onto the other one.
 //! A different port is a different origin, so no second hostname is needed.
+//!
+//! A registry has two ways to attempt the move, and both are covered here for
+//! each of the four requests a push addresses to a registry-supplied URL:
+//! naming the foreign host in a `Location` (refused by `require_same_registry`)
+//! and answering the vetted request with a redirect to it (refused by the
+//! no-redirect client those four requests are issued on).
 
 use std::{
     net::SocketAddr,
@@ -14,9 +20,11 @@ use axum::{
     extract::State,
     http::{header::LOCATION, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{patch, post},
+    routing::{patch, post, put},
     Router,
 };
+use bytes::Bytes;
+use futures_util::stream;
 use oci_client::{
     client::{ClientConfig, ClientProtocol},
     errors::OciDistributionError,
@@ -96,6 +104,20 @@ async fn commit_session() -> Response {
         [(LOCATION, "/v2/testrepo/blobs/committed")],
     )
         .into_response()
+}
+
+/// Hands the caller a foreign host and a same-host session, then answers the
+/// upload request named by `route` with a `307` onto the foreign host.
+///
+/// `307` is the shape that matters: tower's redirect layer takes the original
+/// body on the first hop regardless of whether it can be cloned, so a followed
+/// `307` replays the blob to whatever the `Location` names.
+fn redirect_to(target: String) -> impl Fn() -> std::future::Ready<Response> + Clone {
+    move || {
+        std::future::ready(
+            (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, target.clone())]).into_response(),
+        )
+    }
 }
 
 fn client(monolithic: bool) -> Client {
@@ -193,4 +215,253 @@ async fn same_host_upload_session_still_completes() {
         .push_blob(&reference, BLOB, &blob_digest())
         .await
         .expect("a same-host upload session must complete");
+}
+
+/// A same-host session that hands off mid-flight: the `POST` is answered
+/// honestly and the `PATCH` names the foreign host in its next-`Location`, so
+/// the commit `PUT` is the first request that could cross. That is the
+/// realistic registry handoff, and it reaches a different guard than the two
+/// tests above — those are refused at the chunk `PATCH`, which never lets the
+/// run get this far.
+#[tokio::test]
+async fn the_commit_put_refuses_a_cross_host_next_location() {
+    let seen: Sightings = Arc::default();
+    let foreign = Server::spawn({
+        let seen = seen.clone();
+        |_| Router::new().fallback(record).with_state(seen)
+    })
+    .await;
+
+    let elsewhere = format!("http://{}/v2/testrepo/blobs/uploads/1", foreign.authority);
+    let registry = Server::spawn(move |_| {
+        let range_echo = move |headers: HeaderMap| {
+            let range = headers
+                .get("Content-Range")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("0-0")
+                .to_string();
+            let elsewhere = elsewhere.clone();
+            async move {
+                (
+                    StatusCode::ACCEPTED,
+                    [
+                        (LOCATION.as_str(), elsewhere.as_str()),
+                        ("Range", range.as_str()),
+                    ],
+                )
+                    .into_response()
+            }
+        };
+        Router::new()
+            .route("/v2/testrepo/blobs/uploads/1", patch(range_echo))
+            .route("/v2/testrepo/blobs/uploads/", post(open_session))
+            .with_state("/v2/testrepo/blobs/uploads/1".to_string())
+    })
+    .await;
+
+    let reference = Reference::try_from(format!("{}/testrepo:latest", registry.authority)).unwrap();
+    let error = client(false)
+        .push_blob(&reference, BLOB, &blob_digest())
+        .await
+        .expect_err("a cross-host next-Location must be refused");
+
+    let sightings = seen.lock().unwrap().clone();
+    assert!(
+        sightings.is_empty(),
+        "the foreign host was contacted {sightings:?}"
+    );
+    assert!(
+        matches!(error, OciDistributionError::CrossHostRefused { .. }),
+        "expected a refusal, got {error:?}"
+    );
+}
+
+/// `push_blob_stream` with `use_monolithic_push` reaches
+/// `push_stream_monolithically`, the one push entry point the buffered
+/// `push_blob` above can never take.
+#[tokio::test]
+async fn streamed_monolithic_push_refuses_a_cross_host_upload_location() {
+    let seen: Sightings = Arc::default();
+    let foreign = Server::spawn({
+        let seen = seen.clone();
+        |_| Router::new().fallback(record).with_state(seen)
+    })
+    .await;
+
+    let elsewhere = format!("http://{}/v2/testrepo/blobs/uploads/1", foreign.authority);
+    let registry = Server::spawn(|_| {
+        Router::new()
+            .route("/v2/testrepo/blobs/uploads/", post(open_session))
+            .with_state(elsewhere)
+    })
+    .await;
+
+    let reference = Reference::try_from(format!("{}/testrepo:latest", registry.authority)).unwrap();
+    let body = stream::once(async { Ok(Bytes::from_static(BLOB)) });
+    let error = client(true)
+        .push_blob_stream(&reference, body, &blob_digest(), Some(BLOB.len()))
+        .await
+        .expect_err("a cross-host upload Location must be refused on the streamed path too");
+
+    let sightings = seen.lock().unwrap().clone();
+    assert!(
+        sightings.is_empty(),
+        "the foreign host was contacted {sightings:?}"
+    );
+    assert!(
+        matches!(error, OciDistributionError::CrossHostRefused { .. }),
+        "expected a refusal, got {error:?}"
+    );
+}
+
+/// A `Location` no URL parser accepts is an error, never a panic.
+///
+/// The monolithic path parses the session URL before it vets the origin, so
+/// this is the one case `require_same_registry` cannot reach — and it used to
+/// be an `.unwrap()` a registry could trip from the wire.
+#[tokio::test]
+async fn a_malformed_upload_location_is_an_error_not_a_panic() {
+    let registry = Server::spawn(|_| {
+        Router::new()
+            .route("/v2/testrepo/blobs/uploads/", post(open_session))
+            .with_state("not a url".to_string())
+    })
+    .await;
+
+    let reference = Reference::try_from(format!("{}/testrepo:latest", registry.authority)).unwrap();
+    let error = client(true)
+        .push_blob(&reference, BLOB, &blob_digest())
+        .await
+        .expect_err("a malformed upload Location must be reported, not unwrapped");
+
+    assert!(
+        matches!(error, OciDistributionError::UrlParseError(_)),
+        "expected a parse error, got {error:?}"
+    );
+}
+
+/// The four upload requests, each answered with a `307` onto the foreign host
+/// after the `Location` they were addressed to passed the origin check.
+///
+/// This is the second hop the string check cannot see. Every case must leave
+/// the foreign host untouched and surface the `307` as a status.
+async fn push_against_a_redirecting_registry(
+    build: impl FnOnce(String) -> Router + Send + 'static,
+    push: impl AsyncFnOnce(Client, Reference) -> OciDistributionError,
+    monolithic: bool,
+) {
+    let seen: Sightings = Arc::default();
+    let foreign = Server::spawn({
+        let seen = seen.clone();
+        |_| Router::new().fallback(record).with_state(seen)
+    })
+    .await;
+
+    let elsewhere = format!("http://{}/v2/testrepo/blobs/uploads/1", foreign.authority);
+    let registry = Server::spawn(move |_| build(elsewhere)).await;
+
+    let reference = Reference::try_from(format!("{}/testrepo:latest", registry.authority)).unwrap();
+    let error = push(client(monolithic), reference).await;
+
+    let sightings = seen.lock().unwrap().clone();
+    assert!(
+        sightings.is_empty(),
+        "the redirect was followed onto the foreign host {sightings:?}"
+    );
+    assert!(
+        matches!(error, OciDistributionError::ServerError { code: 307, .. }),
+        "expected the 307 to surface as a status, got {error:?}"
+    );
+}
+
+/// `push_chunk_body`'s `PATCH`.
+#[tokio::test]
+async fn a_chunk_patch_does_not_follow_a_redirect_off_the_registry() {
+    push_against_a_redirecting_registry(
+        |elsewhere| {
+            Router::new()
+                .route(
+                    "/v2/testrepo/blobs/uploads/1",
+                    patch(redirect_to(elsewhere)),
+                )
+                .route("/v2/testrepo/blobs/uploads/", post(open_session))
+                .with_state("/v2/testrepo/blobs/uploads/1".to_string())
+        },
+        async |client: Client, reference: Reference| {
+            client
+                .push_blob(&reference, BLOB, &blob_digest())
+                .await
+                .expect_err("a redirected chunk PATCH must not be followed")
+        },
+        false,
+    )
+    .await;
+}
+
+/// `end_push_chunked_session`'s commit `PUT`.
+#[tokio::test]
+async fn the_commit_put_does_not_follow_a_redirect_off_the_registry() {
+    push_against_a_redirecting_registry(
+        |elsewhere| {
+            Router::new()
+                .route(
+                    "/v2/testrepo/blobs/uploads/1",
+                    patch(accept_chunk).put(redirect_to(elsewhere)),
+                )
+                .route("/v2/testrepo/blobs/uploads/", post(open_session))
+                .with_state("/v2/testrepo/blobs/uploads/1".to_string())
+        },
+        async |client: Client, reference: Reference| {
+            client
+                .push_blob(&reference, BLOB, &blob_digest())
+                .await
+                .expect_err("a redirected commit PUT must not be followed")
+        },
+        false,
+    )
+    .await;
+}
+
+/// `push_monolithically`'s buffered `PUT` — the case that replays the whole
+/// blob, since a `Bytes` body is cloneable.
+#[tokio::test]
+async fn a_monolithic_put_does_not_follow_a_redirect_off_the_registry() {
+    push_against_a_redirecting_registry(
+        |elsewhere| {
+            Router::new()
+                .route("/v2/testrepo/blobs/uploads/1", put(redirect_to(elsewhere)))
+                .route("/v2/testrepo/blobs/uploads/", post(open_session))
+                .with_state("/v2/testrepo/blobs/uploads/1".to_string())
+        },
+        async |client: Client, reference: Reference| {
+            client
+                .push_blob(&reference, BLOB, &blob_digest())
+                .await
+                .expect_err("a redirected monolithic PUT must not be followed")
+        },
+        true,
+    )
+    .await;
+}
+
+/// `push_stream_monolithically`'s streamed `PUT`.
+#[tokio::test]
+async fn a_streamed_monolithic_put_does_not_follow_a_redirect_off_the_registry() {
+    push_against_a_redirecting_registry(
+        |elsewhere| {
+            Router::new()
+                .route("/v2/testrepo/blobs/uploads/1", put(redirect_to(elsewhere)))
+                .route("/v2/testrepo/blobs/uploads/", post(open_session))
+                .with_state("/v2/testrepo/blobs/uploads/1".to_string())
+        },
+        async |client: Client, reference: Reference| {
+            let body = stream::once(async { Ok(Bytes::from_static(BLOB)) });
+            client
+                .push_blob_stream(&reference, body, &blob_digest(), Some(BLOB.len()))
+                .await
+                .expect_err("a redirected streamed PUT must not be followed")
+        },
+        true,
+    )
+    .await;
 }
