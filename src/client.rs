@@ -3693,6 +3693,54 @@ mod test {
         Ok(())
     }
 
+    /// Every construction path yields a client carrying a redirect policy, the
+    /// degradation fallback included.
+    ///
+    /// `Client::new` warns and falls back to `Default` when `try_from` errors,
+    /// and a `ClientConfig` field a caller fills from a user-supplied string —
+    /// `https_proxy` here — is enough to reach that arm. With the policy
+    /// installed only inside `try_from`, the fallback silently restored
+    /// reqwest's default: redirects followed, and the upload path following
+    /// them off the registry (CWE-636, fail-open on error).
+    ///
+    /// Asserted through reqwest's `Debug`, which prints `redirect_policy` only
+    /// when the policy is not the default one. It is the only seam reqwest
+    /// offers short of a TLS fixture; the failure direction is safe, because a
+    /// reqwest that stopped printing the field reds this test rather than
+    /// quietly passing it.
+    #[test]
+    fn no_construction_path_yields_a_client_without_a_redirect_policy() {
+        for (label, client) in [
+            ("Default", Client::default()),
+            (
+                "try_from",
+                Client::new(ClientConfig {
+                    ..Default::default()
+                }),
+            ),
+            (
+                // `Proxy::https` rejects this, so `try_from` errors and
+                // `Client::new` takes its degradation fallback.
+                "degradation fallback",
+                Client::new(ClientConfig {
+                    https_proxy: Some("not a proxy".to_string()),
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let pull = format!("{:?}", client.client);
+            assert!(
+                pull.contains(r#"redirect_policy: "Policy(Custom)""#),
+                "{label}'s pull client lost the no-scheme-downgrade policy: {pull}"
+            );
+            let upload = format!("{:?}", client.no_redirect_client);
+            assert!(
+                upload.contains(r#"redirect_policy: "Policy(None)""#),
+                "{label}'s upload client would follow a redirect: {upload}"
+            );
+        }
+    }
+
     /// The refusal names a target the registry chose, so it is subject to the
     /// same disclosure rule as every other registry-supplied URL this crate
     /// prints.
