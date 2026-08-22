@@ -410,7 +410,7 @@ mod tests {
         );
         assert!(
             is_live(u64::MAX, Some(now)),
-            "Basic credentials never expire, and the margin must not underflow them"
+            "a maximal expiry saturates rather than wrapping the margin subtraction"
         );
     }
 
