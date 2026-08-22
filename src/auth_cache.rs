@@ -71,6 +71,17 @@ impl ChallengeCache {
         cell.get_or_try_init(probe).await.map(Clone::clone)
     }
 
+    /// Installs `info` as `host`'s challenge without probing for it.
+    ///
+    /// A `401` answering an ordinary request carries the same
+    /// `WWW-Authenticate` the probe would have fetched, so the retry that
+    /// follows re-derives its challenge from the rejection itself instead of
+    /// spending a `GET /v2/` to ask the host again.
+    pub(crate) fn seed(&self, host: &str, info: ChallengeInfo) {
+        self.lock()
+            .insert(host.to_string(), Arc::new(OnceCell::new_with(Some(info))));
+    }
+
     /// Forgets everything probed about `host`.
     ///
     /// containerd's `invalidAuthorization`, minus the token half (the caller

@@ -145,7 +145,16 @@ impl TokenCache {
         token: RegistryTokenType,
     ) {
         let expiration = match token {
-            RegistryTokenType::Basic(_, _) => u64::MAX,
+            // A Basic entry is the caller's own username and password, which
+            // `Client::_auth` hands back verbatim from its `authentication`
+            // argument. This key carries no credential identity, so retaining
+            // one serves it to whoever asks next whatever secret *they* passed:
+            // authenticate with one identity, call again with another, and the
+            // second call keeps using the first. It is also pure liability —
+            // the header-attach path falls back to the client's own credential
+            // store, and re-deriving costs no request once the challenge probe
+            // is cached.
+            RegistryTokenType::Basic(_, _) => return,
             RegistryTokenType::Bearer(ref t) => {
                 match parse_expiration_from_jwt(t.token(), self.default_expiration_secs) {
                     Some(value) => value,
@@ -159,16 +168,6 @@ impl TokenCache {
             .write()
             .await
             .insert(key, TokenCacheValue { token, expiration });
-    }
-
-    /// Drops the entry for one `(registry, repository, operation)` key.
-    ///
-    /// Called when the registry answers a request the cached token authorised
-    /// with `401`: the entry outlived what the registry will honour, and
-    /// keeping it would make the retry send the same rejected token again.
-    pub(crate) async fn invalidate(&self, reference: &Reference, op: RegistryOperation) {
-        let key = TokenCacheKey::new(reference, op);
-        self.tokens.write().await.remove(&key);
     }
 
     /// Drops every entry belonging to `registry`, whatever the repository or

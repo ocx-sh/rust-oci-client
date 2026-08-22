@@ -44,11 +44,11 @@ struct Registry {
     hold: Mutex<Option<watch::Receiver<bool>>>,
     /// Repository path prefix -> how many more of its requests answer `401`.
     reject: Mutex<HashMap<String, usize>>,
-    /// Whether a rejection's challenge carries an `error` parameter, which is
-    /// what tells the client to drop everything cached for the host.
-    reject_with_error: AtomicBool,
     /// Whether `GET /v2/` answers with a `WWW-Authenticate` challenge at all.
     challenges: AtomicBool,
+    /// Answer the probe with a `Basic` challenge instead of a `Bearer` one —
+    /// the shape that drives `_auth` into its HTTP Basic fallback.
+    basic_challenge: AtomicBool,
     address: Mutex<String>,
 }
 
@@ -167,6 +167,16 @@ impl StubRegistry {
         })
     }
 
+    /// A client that treats a token carrying no expiry claim as living `secs`
+    /// seconds — the knob a short-lived registry token would turn.
+    fn client_with_token_lifetime(&self, secs: usize) -> Client {
+        Client::new(ClientConfig {
+            protocol: ClientProtocol::Http,
+            default_token_expiration_secs: secs,
+            ..Default::default()
+        })
+    }
+
     fn reference(&self, repository: &str) -> Reference {
         format!("{}/{repository}:latest", self.address())
             .parse()
@@ -230,12 +240,20 @@ async fn serve(State(state): State<Arc<Registry>>, request: Request) -> Response
         if !state.challenges.load(Ordering::SeqCst) {
             return (axum::http::StatusCode::OK, "{}").into_response();
         }
-        return challenge_response(&state, false);
+        if state.basic_challenge.load(Ordering::SeqCst) {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                [("www-authenticate", r#"Basic realm="stub""#)],
+                "unauthorized",
+            )
+                .into_response();
+        }
+        return challenge_response(&state);
     }
 
     state.resource_requests.fetch_add(1, Ordering::SeqCst);
     if state.take_rejection(&path) {
-        return challenge_response(&state, state.reject_with_error.load(Ordering::SeqCst));
+        return challenge_response(&state);
     }
 
     if path.contains("/tags/list") {
@@ -255,17 +273,15 @@ async fn serve(State(state): State<Arc<Registry>>, request: Request) -> Response
     (axum::http::StatusCode::OK, "blob").into_response()
 }
 
-fn challenge_response(state: &Registry, with_error: bool) -> Response {
-    let error = if with_error {
-        r#",error="invalid_token""#
-    } else {
-        ""
-    };
+/// A plain `Bearer` challenge with **no** `error` parameter — the shape a
+/// registry that has revoked a token commonly answers with, and precisely the
+/// one an `error=`-only purge would ignore.
+fn challenge_response(state: &Registry) -> Response {
     (
         axum::http::StatusCode::UNAUTHORIZED,
         [(
             "www-authenticate",
-            format!(r#"Bearer realm="{}",service="stub"{error}"#, state.realm()),
+            format!(r#"Bearer realm="{}",service="stub""#, state.realm()),
         )],
         "unauthorized",
     )
@@ -646,12 +662,8 @@ async fn a_cached_probe_does_not_suppress_a_repository_401() {
     assert_eq!(registry.state.probes(), 1);
     assert_eq!(registry.state.exchanges(), 0);
 
-    // B rejects with a challenge naming an error, which is containerd's signal
-    // that everything cached for the host is stale.
-    registry
-        .state
-        .reject_with_error
-        .store(true, Ordering::SeqCst);
+    // B is rejected with a plain challenge — no `error` parameter, the shape a
+    // revoked token draws and the one an `error=`-only purge would ignore.
     registry.state.reject("test/denied", 1);
     registry.state.challenges.store(true, Ordering::SeqCst);
     client
@@ -666,8 +678,122 @@ async fn a_cached_probe_does_not_suppress_a_repository_401() {
     );
     assert_eq!(
         registry.state.probes(),
+        1,
+        "the retry re-derives its challenge from the 401, not from a fresh probe"
+    );
+}
+
+/// The `401` drops every scoped token under the host, not just the one that was
+/// rejected — containerd's `invalidAuthorization`, which deletes the whole
+/// handler. A registry that revokes one credential has usually revoked them
+/// all, and a sibling repository still holding a token minted from it would go
+/// on sending it until expiry.
+#[tokio::test]
+async fn a_401_purges_every_scoped_token_for_the_host() {
+    let registry = StubRegistry::start().await;
+    let client = registry.client();
+    let sibling = registry.reference("test/sibling");
+    let rejected = registry.reference("test/rejected");
+
+    client
+        .list_tags(&sibling, &basic(), None, None)
+        .await
+        .unwrap();
+    client
+        .list_tags(&rejected, &basic(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(registry.state.exchanges(), 2, "one exchange per repository");
+
+    registry.state.reject("test/rejected", 1);
+    client
+        .list_tags(&rejected, &basic(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        registry.state.exchanges(),
+        3,
+        "the rejected repository re-authenticates for its retry"
+    );
+
+    client
+        .list_tags(&sibling, &basic(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        registry.state.exchanges(),
+        4,
+        "the sibling's token was minted from the same credential and must be dropped too"
+    );
+    assert_eq!(
+        registry.state.probes(),
+        1,
+        "the seeded challenge covers the whole host — no second probe"
+    );
+}
+
+/// The token cache never answers with a caller's own credentials.
+///
+/// `_auth` builds its HTTP Basic fallback from the `authentication` argument it
+/// was handed, and the cache key carries no credential identity — so a cached
+/// Basic entry is served to whoever asks next whatever secret *they* passed,
+/// and it wins over the client's own credential store. A pre-warmed entry
+/// standing in for the previous caller is the shape of that bleed.
+#[tokio::test]
+async fn a_cached_credential_never_outranks_the_callers_own() {
+    let registry = StubRegistry::start().await;
+    registry.state.basic_challenge.store(true, Ordering::SeqCst);
+    let client = registry.client();
+    let image = registry.reference("test/pkg");
+
+    client
+        .tokens
+        .insert(
+            &image,
+            RegistryOperation::Pull,
+            RegistryTokenType::Basic("cached-user".to_string(), "cached-pass".to_string()),
+        )
+        .await;
+
+    let credentials = RegistryAuth::Basic("real-user".to_string(), "real-pass".to_string());
+    client
+        .list_tags(&image, &credentials, None, None)
+        .await
+        .unwrap();
+
+    let sent = registry.state.authorizations();
+    assert_eq!(
+        sent.last().cloned().unwrap_or_default(),
+        format!("Basic {}", base64_basic("real-user", "real-pass")),
+        "the caller's own credentials must reach the wire, saw {sent:?}"
+    );
+}
+
+/// C-029 on the live path: a short-lived token is never handed to a *later*
+/// caller, so the second call mints again rather than sending one the registry
+/// is about to refuse.
+///
+/// The unit tests pin the predicate; this pins that it is wired into the path
+/// `auth()` actually takes. What it cannot pin is the token handed back to the
+/// caller that minted it, or to a coalesced waiter — nothing better exists to
+/// hand them, and a request that outlives it is what C-020's retry is for.
+#[tokio::test]
+async fn a_short_lived_token_is_never_served_to_a_later_caller() {
+    let registry = StubRegistry::start().await;
+    let client = registry.client_with_token_lifetime(10);
+    let image = registry.reference("test/pkg");
+
+    for _ in 0..2 {
+        client
+            .auth(&image, &basic(), RegistryOperation::Pull)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        registry.state.exchanges(),
         2,
-        "the rejection must drop the host entry so the probe is re-derived"
+        "a token with 10 s of life must not be cached across the 30 s renewal margin"
     );
 }
 
@@ -734,4 +860,25 @@ async fn a_second_401_is_an_authentication_failure() {
         2,
         "one retry and no more — a loop would keep going"
     );
+}
+
+/// `base64(user:password)`, the one line of RFC 7617 this file needs. A
+/// dependency for a 64-entry table lookup would cost more than it saves.
+fn base64_basic(user: &str, password: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let input = format!("{user}:{password}").into_bytes();
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let bits = chunk.iter().enumerate().fold(0u32, |acc, (index, byte)| {
+            acc | (u32::from(*byte) << (16 - 8 * index))
+        });
+        for slot in 0..4 {
+            if slot <= chunk.len() {
+                out.push(ALPHABET[((bits >> (18 - 6 * slot)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }

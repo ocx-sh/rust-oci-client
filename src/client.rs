@@ -1876,12 +1876,20 @@ impl Client {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Range",
-            format!("{range_start}-{end_range_inclusive}").parse().unwrap(),
+            format!("{range_start}-{end_range_inclusive}")
+                .parse()
+                .unwrap(),
         );
         headers.insert("Content-Length", format!("{chunk_len}").parse().unwrap());
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
-        debug!(?range_start, ?end_range_inclusive, chunk_len, ?location, "Pushing chunk");
+        debug!(
+            ?range_start,
+            ?end_range_inclusive,
+            chunk_len,
+            ?location,
+            "Pushing chunk"
+        );
 
         self.require_same_registry(image, location)?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
@@ -2806,24 +2814,6 @@ fn bearer_value(token: &RegistryTokenType) -> Option<String> {
     }
 }
 
-/// True when a `WWW-Authenticate` header carries an `error` parameter.
-///
-/// containerd treats exactly this as "what I cached for this host is no longer
-/// valid" rather than invalidating on every `401`: a `401` with a plain
-/// challenge is a request that arrived unauthenticated, while `error=` names a
-/// credential or token the registry has actively rejected.
-fn challenge_carries_error(header: &HeaderValue) -> bool {
-    let Ok(value) = header.to_str() else {
-        return false;
-    };
-    ChallengeParser::new(value).flatten().any(|challenge| {
-        challenge
-            .params
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("error"))
-    })
-}
-
 /// The request builder wrapper allows to be instantiated from a
 /// `Client` and allows composable operations on the request builder,
 /// to produce a `RequestBuilder` object that can be executed.
@@ -2952,11 +2942,21 @@ impl<'a> RequestBuilderWrapper<'a> {
             return Ok(res);
         };
 
+        // Everything cached for this host is now suspect, not just the scope
+        // that was rejected: a registry that has *revoked* a token commonly
+        // refuses it with a plain `Bearer` challenge and no `error` parameter,
+        // so narrowing the purge to `error=` leaves the revoked token in place
+        // and the retry sends it again. The second-`401` rule below is what
+        // makes the wider trigger safe.
         let registry = image.resolve_registry();
-        if challenge_carries_error(header) {
-            self.client.invalidate_auth(registry).await;
-        } else {
-            self.client.tokens.invalidate(image, op).await;
+        let challenge = BearerChallenge::try_from(header).ok();
+        self.client.invalidate_auth(registry).await;
+        if let Some(challenge) = challenge {
+            // The rejection carried the challenge the retry needs, so seed it
+            // rather than paying a `GET /v2/` to ask the host for it again.
+            self.client
+                .challenges
+                .seed(registry, ChallengeInfo::Bearer(challenge));
         }
 
         let Some(authentication) = self.client.auth_store.read().await.get(registry).cloned()
