@@ -2936,12 +2936,21 @@ impl<'a> RequestBuilderWrapper<'a> {
         // challenge and no `error` parameter, so this response cannot tell a
         // refused scope from a dead credential — but nor is that a reason to
         // charge every other scope under the host a fresh token exchange on
-        // the guess. One forbidden repository inside a 512-wide index fan-out
-        // would re-mint the other 511.
+        // the guess.
         //
         // The wide purge is deferred, not abandoned: the retry below is the
         // experiment that separates the two cases, and a `401` that survives a
         // freshly minted token escalates to `purge_registry`.
+        //
+        // So this narrows the *recovered* case only, and deliberately claims no
+        // more. A repository that is **persistently** forbidden answers the
+        // retry with a second `401` (`insufficient_scope`), the escalation
+        // fires, and every other scope under the host re-mints after all — one
+        // round-trip later than before, never more. What it buys is that a
+        // transient rejection, which is the common one, no longer charges a
+        // 512-wide fan-out for a token exchange each. Gating the escalation on
+        // the challenge's `error` parameter would close the persistent case
+        // too; that is a separate decision, not an oversight here.
         //
         // The cached *challenge* is dropped unconditionally and reseeded from
         // this rejection's own header — it is a realm, not a credential, and
