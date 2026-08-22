@@ -345,7 +345,10 @@ const MAX_REDIRECTS: usize = 10;
 fn no_scheme_downgrade_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if is_scheme_downgrade(attempt.previous().last(), attempt.url()) {
-            let refusal = format!("refusing a redirect from HTTPS to plaintext {}", attempt.url());
+            let refusal = format!(
+                "refusing a redirect from HTTPS to plaintext {}",
+                attempt.url()
+            );
             return attempt.error(OciDistributionError::GenericError(Some(refusal)));
         }
         if attempt.previous().len() >= MAX_REDIRECTS {
@@ -3532,9 +3535,18 @@ mod test {
         // Everything else keeps working - CDN handoff on the pull path is a
         // cross-host https redirect, and a plain-HTTP registry stays plain.
         for (previous, next) in [
-            ("https://registry.example.com/v2/x", "https://cdn.example.net/blob"),
-            ("http://registry.example.com/v2/x", "http://registry.example.com/other"),
-            ("http://registry.example.com/v2/x", "https://registry.example.com/other"),
+            (
+                "https://registry.example.com/v2/x",
+                "https://cdn.example.net/blob",
+            ),
+            (
+                "http://registry.example.com/v2/x",
+                "http://registry.example.com/other",
+            ),
+            (
+                "http://registry.example.com/v2/x",
+                "https://registry.example.com/other",
+            ),
         ] {
             let previous = Url::parse(previous)?;
             let next = Url::parse(next)?;
@@ -3597,7 +3609,10 @@ mod test {
         let client = Client::default();
         let image = Reference::try_from(HELLO_IMAGE_TAG)?;
 
-        client.require_same_registry(&image, "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc")?;
+        client.require_same_registry(
+            &image,
+            "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        )?;
 
         // A registry answering the upload-session POST with a foreign Location,
         // downgrading the scheme on its own host, or naming something that is

@@ -42,7 +42,9 @@ impl Drop for Server {
 
 impl Server {
     async fn spawn(build: impl FnOnce(String) -> Router) -> Self {
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
         let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let app = build(authority.clone());
         let handle = tokio::spawn(async move {
@@ -89,7 +91,11 @@ async fn accept_chunk(headers: HeaderMap) -> Response {
 
 /// Commits the session.
 async fn commit_session() -> Response {
-    (StatusCode::CREATED, [(LOCATION, "/v2/testrepo/blobs/committed")]).into_response()
+    (
+        StatusCode::CREATED,
+        [(LOCATION, "/v2/testrepo/blobs/committed")],
+    )
+        .into_response()
 }
 
 fn client(monolithic: bool) -> Client {
@@ -138,7 +144,10 @@ async fn chunked_push_refuses_a_cross_host_upload_location() {
 
     // Asserted before the error shape: this is the security-relevant half, and
     // it names the leak when it fires.
-    assert!(sightings.is_empty(), "the foreign host was contacted {sightings:?}");
+    assert!(
+        sightings.is_empty(),
+        "the foreign host was contacted {sightings:?}"
+    );
     assert!(
         matches!(error, OciDistributionError::CrossHostRefused { .. }),
         "expected a refusal, got {error:?}"
@@ -151,7 +160,10 @@ async fn monolithic_push_refuses_a_cross_host_upload_location() {
 
     // Asserted before the error shape: this is the security-relevant half, and
     // it names the leak when it fires.
-    assert!(sightings.is_empty(), "the foreign host was contacted {sightings:?}");
+    assert!(
+        sightings.is_empty(),
+        "the foreign host was contacted {sightings:?}"
+    );
     assert!(
         matches!(error, OciDistributionError::CrossHostRefused { .. }),
         "expected a refusal, got {error:?}"
@@ -166,7 +178,10 @@ async fn same_host_upload_session_still_completes() {
     let registry = Server::spawn(|authority| {
         Router::new()
             .route("/v2/testrepo/blobs/uploads/", post(open_session))
-            .route("/v2/testrepo/blobs/uploads/1", patch(accept_chunk).put(commit_session))
+            .route(
+                "/v2/testrepo/blobs/uploads/1",
+                patch(accept_chunk).put(commit_session),
+            )
             // Absolute, on the registry's own host - the shape the guard has to
             // keep working, not merely the relative form.
             .with_state(format!("http://{authority}/v2/testrepo/blobs/uploads/1"))
