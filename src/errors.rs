@@ -86,8 +86,11 @@ pub enum OciDistributionError {
     #[error("Failed to decode registry token: {0}")]
     RegistryTokenDecodeError(String),
     /// Transparent wrapper around `reqwest::Error`
+    ///
+    /// The URL reqwest attached is redacted on the way in; see
+    /// [`From<reqwest::Error>`](OciDistributionError#impl-From<Error>).
     #[error(transparent)]
-    RequestError(#[from] reqwest::Error),
+    RequestError(reqwest::Error),
     /// HTTP Server error
     #[error("Server error: url {url}, code: {code}, message: {message}")]
     ServerError {
@@ -247,6 +250,29 @@ pub enum OciErrorCode {
     Unsupported,
     /// Too many requests from client
     Toomanyrequests,
+}
+
+impl From<reqwest::Error> for OciDistributionError {
+    /// Redacts the URL reqwest attached, before anything can print it.
+    ///
+    /// reqwest renders that URL verbatim in **both** `Display`
+    /// (`reqwest-0.13.4/src/error.rs:279-281`, `" for url ({url})"`) and
+    /// `Debug` (`:225-227`), and on a refused redirect it is `previous_url`
+    /// (`src/redirect.rs:334`) — the presigned CDN URL the registry handed out,
+    /// signature in the query. Redacting only the message this crate writes
+    /// leaves the one URL that actually carries a credential printed raw.
+    ///
+    /// Rewriting the value rather than the message is what `Error::url_mut`
+    /// exists for — its own doc names this use case — and it covers every
+    /// renderer and every consumer at once instead of one message at a time.
+    /// `is_redirect()`, `is_timeout()`, the source chain and downcasting are
+    /// untouched.
+    fn from(mut error: reqwest::Error) -> Self {
+        if let Some(url) = error.url_mut() {
+            *url = crate::client::redact_url(url);
+        }
+        Self::RequestError(error)
+    }
 }
 
 #[cfg(test)]

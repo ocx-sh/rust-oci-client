@@ -479,3 +479,42 @@ async fn a_streamed_monolithic_put_does_not_follow_a_redirect_off_the_registry()
     )
     .await;
 }
+
+/// A `ServerError` raised on an upload session names a URL the registry chose,
+/// so it is redacted like every other registry-supplied URL this crate prints.
+///
+/// Only the session URL's *origin* was ever vetted; its path and query are the
+/// registry's by construction, and `?_state=<token>` is the shape distribution
+/// itself uses. `Policy::none()` routes 3xx answers onto this same path, so it
+/// is a refusal path now in a way it was not before.
+#[tokio::test]
+async fn a_server_error_on_an_upload_session_is_redacted() {
+    let registry = Server::spawn(|_| {
+        Router::new()
+            .route(
+                "/v2/testrepo/blobs/uploads/1",
+                patch(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route("/v2/testrepo/blobs/uploads/", post(open_session))
+            // Same host, so the origin check passes — and signed, the way a
+            // registry that hands sessions to object storage signs them.
+            .with_state("/v2/testrepo/blobs/uploads/1?X-Amz-Signature=deadbeef".to_string())
+    })
+    .await;
+
+    let reference = Reference::try_from(format!("{}/testrepo:latest", registry.authority)).unwrap();
+    let error = client(false)
+        .push_blob(&reference, BLOB, &blob_digest())
+        .await
+        .expect_err("a 500 on the chunk PATCH must surface");
+
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("deadbeef"),
+        "the server error published the session signature: {rendered}"
+    );
+    assert!(
+        rendered.contains("X-Amz-Signature"),
+        "the parameter name must survive, or there is nothing to diagnose: {rendered}"
+    );
+}

@@ -318,8 +318,8 @@ impl Default for Client {
             tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
             challenges: Arc::default(),
             token_flights: Arc::default(),
-            client: default_seeded_client(no_scheme_downgrade_policy()),
-            no_redirect_client: default_seeded_client(reqwest::redirect::Policy::none()),
+            client: default_seeded_client(no_scheme_downgrade_policy),
+            no_redirect_client: default_seeded_client(reqwest::redirect::Policy::none),
             push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
         }
     }
@@ -335,6 +335,12 @@ pub trait ClientConfigSource {
 
 /// reqwest's default redirect limit, restated because a custom policy replaces
 /// the default wholesale rather than wrapping it.
+///
+/// Compared with `>`, not `>=`, for the same reason reqwest's own limit arm
+/// does (`reqwest-0.13.4/src/redirect.rs:132-136`): `previous` is pushed before
+/// the policy is consulted (`:315`) and its first entry is the original
+/// request, not a redirection. `>=` would have allowed nine hops while claiming
+/// ten.
 const MAX_REDIRECTS: usize = 10;
 
 /// Follows redirects like reqwest's default, except never from `https` to
@@ -366,8 +372,16 @@ fn no_scheme_downgrade_policy() -> reqwest::redirect::Policy {
             let refusal = scheme_downgrade_refusal(attempt.url());
             return attempt.error(OciDistributionError::GenericError(Some(refusal)));
         }
-        if attempt.previous().len() >= MAX_REDIRECTS {
-            return attempt.stop();
+        // `attempt.error`, never `attempt.stop`: stop hands the 3xx back as an
+        // `Ok` response (`redirect.rs:189-196`), which `error_for_status_ref`
+        // treats as success — so a blob behind an over-long chain would answer
+        // "exists" to a HEAD and the layer would never be uploaded. reqwest's
+        // own limit arm errors, and replacing the default policy must not
+        // quietly relax that.
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error(OciDistributionError::GenericError(Some(format!(
+                "too many redirects (limit {MAX_REDIRECTS})"
+            ))));
         }
         attempt.follow()
     })
@@ -1109,7 +1123,7 @@ impl Client {
                 if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(OciDistributionError::ServerError {
                         code: status.as_u16(),
-                        url: realm.to_string(),
+                        url: redacted_display_str(realm),
                         message: reason,
                     });
                 }
@@ -2377,7 +2391,10 @@ impl Client {
                 res.status(),
             )))
         } else {
-            let url = res.url().to_string();
+            // Registry-chosen on both clients: the upload-session URL on the
+            // no-redirect one, the post-redirect URL on the general one. Only
+            // its origin was ever vetted, so path and query are still theirs.
+            let url = redacted_display_url(res.url());
             let code = res.status().as_u16();
             let message = res.text().await?;
             Err(OciDistributionError::ServerError { url, code, message })
@@ -2711,6 +2728,13 @@ const REDACTED_QUERY_PARAMS: &[&str] = &[
 /// end up in an error message a user pastes into a bug report. Parameter names
 /// survive, because knowing a request was signed is the diagnosis.
 fn redacted_display_url(url: &Url) -> String {
+    redact_url(url).to_string()
+}
+
+/// [`redacted_display_url`] as a `Url`, for the places that must store one
+/// rather than print it — notably `From<reqwest::Error>`, which rewrites the
+/// URL reqwest attached so that every renderer sees the redacted form.
+pub(crate) fn redact_url(url: &Url) -> Url {
     let mut url = url.clone();
     // Both fail only for a cannot-be-a-base URL, which has no userinfo to strip.
     let _ = url.set_username(""); // redaction: nothing to strip on an opaque URL
@@ -2733,7 +2757,7 @@ fn redacted_display_url(url: &Url) -> String {
             .collect();
         url.query_pairs_mut().clear().extend_pairs(masked);
     }
-    url.to_string()
+    url
 }
 
 /// [`redacted_display_url`] for a value that has not been parsed yet.
@@ -3302,22 +3326,28 @@ fn bundled_root_certificates() -> Vec<Certificate> {
 /// fine. Seeding the bundled roots takes the `Verifier::new_with_extra_roots`
 /// path, which never errors on an empty store and still merges the native store
 /// (`SSL_CERT_FILE` / `SSL_CERT_DIR`) on top.
-fn default_seeded_client(redirect: reqwest::redirect::Policy) -> reqwest::Client {
-    // The policy goes on first so that no arm below can return a client without
-    // it: `Client::new`'s degradation fallback reaches this function, and a
-    // guard that lives only in `TryFrom` would be silently dropped there.
-    let builder = reqwest::Client::builder().redirect(redirect);
-    let builder = match convert_certificates(&bundled_root_certificates()) {
-        Ok(certs) => builder.tls_certs_merge(certs),
+fn default_seeded_client(redirect: impl Fn() -> reqwest::redirect::Policy) -> reqwest::Client {
+    // A factory rather than a `Policy`, which is not `Clone`: every builder
+    // below mints its own, so the roots are the only thing that can degrade.
+    let with_policy = || reqwest::Client::builder().redirect(redirect());
+    match convert_certificates(&bundled_root_certificates()) {
+        Ok(certs) => with_policy().tls_certs_merge(certs).build(),
         // ponytail: the bundled roots are a compiled-in constant, so a
         // conversion failure means there is no other set to reach for.
-        Err(_) => builder,
-    };
-    // ponytail: a seeded build cannot hit the empty-store error the roots
-    // exist to prevent; any other builder failure is genuinely exceptional,
-    // so fall back to the stock default (itself fine when a system store
-    // is present — the only case the seeded build could plausibly fail).
-    builder.build().unwrap_or_default()
+        Err(_) => with_policy().build(),
+    }
+    // Retry without the roots rather than falling straight through: the roots
+    // are the only input here a build can plausibly reject, and dropping them
+    // keeps the redirect policy that `unwrap_or_default` below would not.
+    .or_else(|_| with_policy().build())
+    // ponytail: this last resort IS policy-free — `reqwest::Client::default()`
+    // is a stock client that follows redirects. Nothing better exists: a
+    // `reqwest::Client` is only reachable through a builder, so a builder that
+    // refuses twice leaves this or a panic, and `Client::default()` panics
+    // anyway on the one host where a seeded build could plausibly fail (no
+    // system trust store). Named rather than claimed away — no test can reach
+    // it, because no input available here makes `build()` fail.
+    .unwrap_or_default()
 }
 
 impl Default for ClientConfig {
