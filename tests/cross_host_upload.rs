@@ -518,3 +518,110 @@ async fn a_server_error_on_an_upload_session_is_redacted() {
         "the parameter name must survive, or there is nothing to diagnose: {rendered}"
     );
 }
+
+/// The `POST` that opens the session must not be relocated either.
+///
+/// This one has no `Location` to vet — it is the request that *asks* for one —
+/// so `require_same_registry` cannot help and the no-redirect client is the
+/// only thing standing between a hostile registry and a `POST` to an address
+/// the caller never named. The classic target is a link-local metadata
+/// endpoint, which is why the foreign listener here must stay untouched.
+async fn open_session_against_a_redirecting_registry(
+    monolithic: bool,
+    build: impl FnOnce(StatusCode, String) -> Router + Send + 'static,
+    push: impl AsyncFnOnce(Client, Reference) -> OciDistributionError,
+) {
+    let seen: Sightings = Arc::default();
+    let foreign = Server::spawn({
+        let seen = seen.clone();
+        |_| Router::new().fallback(record).with_state(seen)
+    })
+    .await;
+
+    let elsewhere = format!("http://{}/v2/testrepo/blobs/uploads/1", foreign.authority);
+    let registry = Server::spawn(move |_| build(StatusCode::TEMPORARY_REDIRECT, elsewhere)).await;
+
+    let reference = Reference::try_from(format!("{}/testrepo:latest", registry.authority)).unwrap();
+    let error = push(client(monolithic), reference).await;
+
+    let sightings = seen.lock().unwrap().clone();
+    assert!(
+        sightings.is_empty(),
+        "the session-opening POST was relocated onto the foreign host {sightings:?}"
+    );
+    assert!(
+        matches!(error, OciDistributionError::ServerError { code: 307, .. }),
+        "expected the 307 to surface as a status, got {error:?}"
+    );
+}
+
+/// `begin_push_chunked_session`.
+#[tokio::test]
+async fn the_chunked_session_post_does_not_follow_a_redirect_off_the_registry() {
+    open_session_against_a_redirecting_registry(
+        false,
+        |status, elsewhere| {
+            Router::new()
+                .route(
+                    "/v2/testrepo/blobs/uploads/",
+                    post(redirect_to(status, elsewhere)),
+                )
+                .with_state(String::new())
+        },
+        async |client: Client, reference: Reference| {
+            client
+                .push_blob(&reference, BLOB, &blob_digest())
+                .await
+                .expect_err("a redirected session POST must not be followed")
+        },
+    )
+    .await;
+}
+
+/// `begin_push_monolithical_session`.
+#[tokio::test]
+async fn the_monolithic_session_post_does_not_follow_a_redirect_off_the_registry() {
+    open_session_against_a_redirecting_registry(
+        true,
+        |status, elsewhere| {
+            Router::new()
+                .route(
+                    "/v2/testrepo/blobs/uploads/",
+                    post(redirect_to(status, elsewhere)),
+                )
+                .with_state(String::new())
+        },
+        async |client: Client, reference: Reference| {
+            client
+                .push_blob(&reference, BLOB, &blob_digest())
+                .await
+                .expect_err("a redirected session POST must not be followed")
+        },
+    )
+    .await;
+}
+
+/// `mount_blob` — the third `POST` to the same endpoint, and the one the
+/// finding did not name.
+#[tokio::test]
+async fn the_mount_post_does_not_follow_a_redirect_off_the_registry() {
+    open_session_against_a_redirecting_registry(
+        false,
+        |status, elsewhere| {
+            Router::new()
+                .route(
+                    "/v2/testrepo/blobs/uploads/",
+                    post(redirect_to(status, elsewhere)),
+                )
+                .with_state(String::new())
+        },
+        async |client: Client, reference: Reference| {
+            let source = Reference::try_from("other.example.com/sourcerepo:latest").unwrap();
+            client
+                .mount_blob(&reference, &source, &blob_digest())
+                .await
+                .expect_err("a redirected mount POST must not be followed")
+        },
+    )
+    .await;
+}

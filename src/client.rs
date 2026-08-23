@@ -1768,7 +1768,7 @@ impl Client {
     async fn begin_push_monolithical_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_monolithical_session");
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1791,7 +1791,7 @@ impl Client {
     async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -2050,12 +2050,13 @@ impl Client {
         )
         .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
 
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url.clone()))
+                .apply_auth(image, RegistryOperation::Push)
+                .await?
+                .into_request_builder()
+                .send()
+                .await?;
 
         // A spec-conforming registry either mounts the blob (201) or, on a miss,
         // declines and opens a regular upload session (202) at the returned
@@ -2976,13 +2977,28 @@ impl<'a> RequestBuilderWrapper<'a> {
 
     /// Like [`from_client`], but on a client that never follows redirects.
     ///
-    /// For requests addressed to a URL the registry chose — every upload
-    /// session URL. `require_same_registry` vets the `Location` string, but a
-    /// followed 3xx is a second registry-chosen target that the string check
-    /// never saw: reqwest replays the request there, blob body included, and
-    /// only the credential is stripped. Refusing to follow is what makes the
-    /// origin check hold for more than one hop; the 3xx surfaces as a status,
-    /// which `extract_location_header` reports as a `ServerError`.
+    /// For the whole blob-upload flow — the `POST` that opens or mounts a
+    /// session, and every request addressed to the session URL it hands back.
+    ///
+    /// On the session URL the reason is that `require_same_registry` vets the
+    /// `Location` *string*: a followed 3xx is a second registry-chosen target
+    /// the string check never saw, and reqwest replays the request there, blob
+    /// body included, with only the credential stripped. Refusing to follow is
+    /// what makes the origin check hold for more than one hop.
+    ///
+    /// On the opening `POST` there is no `Location` yet, and that is precisely
+    /// the gap: the URL is minted from the `Reference`, so nothing about it is
+    /// registry-chosen, but a `3xx` relocates the request itself before any
+    /// check exists to run. A plaintext registry answering
+    /// `307 Location: http://169.254.169.254/…` gets a `POST` to an address the
+    /// caller never named (CWE-918). Credentials are not the exposure — reqwest
+    /// strips them cross-origin — the reachability is.
+    ///
+    /// Either way the 3xx surfaces as a status, which `extract_location_header`
+    /// reports as a `ServerError`. The spec permits a redirect on any endpoint,
+    /// but in practice registries use it for blob `GET`s handing off to storage;
+    /// on this endpoint the 202's own `Location` is the designed channel for
+    /// exactly that, so a 3xx here is redundant with it.
     fn from_client_no_redirect(
         client: &'a Client,
         f: impl Fn(&reqwest::Client) -> RequestBuilder,
