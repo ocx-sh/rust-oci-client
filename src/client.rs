@@ -303,6 +303,10 @@ pub struct Client {
     // one handshake instead of each running their own.
     token_flights: Arc<TokenFlights>,
     client: reqwest::Client,
+    // The same configuration as `client`, minus redirect following. Requests
+    // addressed to a registry-supplied upload-session URL go through this one:
+    // see `RequestBuilderWrapper::from_client_no_redirect`.
+    no_redirect_client: reqwest::Client,
     push_chunk_size: usize,
 }
 
@@ -314,7 +318,8 @@ impl Default for Client {
             tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
             challenges: Arc::default(),
             token_flights: Arc::default(),
-            client: default_seeded_client(),
+            client: default_seeded_client(no_scheme_downgrade_policy),
+            no_redirect_client: default_seeded_client(reqwest::redirect::Policy::none),
             push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
         }
     }
@@ -330,29 +335,53 @@ pub trait ClientConfigSource {
 
 /// reqwest's default redirect limit, restated because a custom policy replaces
 /// the default wholesale rather than wrapping it.
+///
+/// Compared with `>`, not `>=`, for the same reason reqwest's own limit arm
+/// does (`reqwest-0.13.4/src/redirect.rs:132-136`): `previous` is pushed before
+/// the policy is consulted (`:315`) and its first entry is the original
+/// request, not a redirection. `>=` would have allowed nine hops while claiming
+/// ten.
 const MAX_REDIRECTS: usize = 10;
 
 /// Follows redirects like reqwest's default, except never from `https` to
 /// `http`.
 ///
-/// reqwest drops `Authorization` when a redirect changes host or port, but not
-/// when it changes only the scheme, so a registry on an explicit port answering
-/// `https://reg:8443/…` with `Location: http://reg:8443/…` keeps the bearer
-/// token and sends it in the clear (CWE-319). Redirects are load-bearing on the
-/// pull path — registries hand blobs off to CDNs that way — so refusing all of
-/// them (`Policy::none`) is not an option, and `https_only` would break
-/// registries deliberately configured as plain HTTP.
+/// reqwest already strips `Authorization` on a scheme-only change — its
+/// `cross_host` predicate compares scheme alongside host and port
+/// (`reqwest-0.13.4/src/redirect.rs:241-243`) — so the credential leak is not
+/// what this policy adds. It adds the other half: stripping a header is a
+/// *header* mitigation and the request still goes, so the URL, the request
+/// body, and the manifest or blob bytes travel to the plaintext target in the
+/// clear (CWE-319 on the request itself, not only CWE-522 on the header).
+/// Refusing the hop means nothing reaches that target at all.
+///
+/// The `redirect.rs` claim is version-dependent: reqwest 0.12's predicate has
+/// only the host and port terms, and a future version could drop the scheme
+/// term again. Re-check it on a reqwest bump rather than trusting this comment
+/// — if it ever regresses, the credential leak returns and this policy becomes
+/// the only thing closing it.
+///
+/// Redirects are load-bearing on the pull path — registries hand blobs off to
+/// CDNs that way — so refusing all of them (`Policy::none`) is not an option
+/// here, and `https_only` would break registries deliberately configured as
+/// plain HTTP. The upload path is the exception and does use `Policy::none`:
+/// see [`RequestBuilderWrapper::from_client_no_redirect`].
 fn no_scheme_downgrade_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if is_scheme_downgrade(attempt.previous().last(), attempt.url()) {
-            let refusal = format!(
-                "refusing a redirect from HTTPS to plaintext {}",
-                attempt.url()
-            );
+            let refusal = scheme_downgrade_refusal(attempt.url());
             return attempt.error(OciDistributionError::GenericError(Some(refusal)));
         }
-        if attempt.previous().len() >= MAX_REDIRECTS {
-            return attempt.stop();
+        // `attempt.error`, never `attempt.stop`: stop hands the 3xx back as an
+        // `Ok` response (`redirect.rs:189-196`), which `error_for_status_ref`
+        // treats as success — so a blob behind an over-long chain would answer
+        // "exists" to a HEAD and the layer would never be uploaded. reqwest's
+        // own limit arm errors, and replacing the default policy must not
+        // quietly relax that.
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error(OciDistributionError::GenericError(Some(format!(
+                "too many redirects (limit {MAX_REDIRECTS})"
+            ))));
         }
         attempt.follow()
     })
@@ -367,65 +396,99 @@ fn is_scheme_downgrade(previous: Option<&Url>, next: &Url) -> bool {
     previous.is_some_and(|previous| previous.scheme() == "https" && next.scheme() == "http")
 }
 
+/// What a refused downgrade says, factored out for the same reason
+/// [`is_scheme_downgrade`] is: the closure has no test seam.
+///
+/// The target is registry-chosen — a downgrade to a collector carries whatever
+/// query that collector wants echoed — so it is redacted before it reaches a
+/// message the user pastes into a bug report.
+fn scheme_downgrade_refusal(target: &Url) -> String {
+    format!(
+        "refusing a redirect from HTTPS to plaintext {}",
+        redacted_display_url(target)
+    )
+}
+
+/// Everything a `ClientConfig` implies about the underlying HTTP client except
+/// its redirect policy.
+///
+/// Factored out because a `Client` holds two `reqwest::Client`s that differ on
+/// exactly that one axis, and a `reqwest::ClientBuilder` cannot be cloned. Any
+/// setting added here reaches both automatically; a setting applied to one
+/// builder only would silently make the upload path less configured than the
+/// rest of the client.
+fn configured_builder(config: &ClientConfig) -> Result<reqwest::ClientBuilder> {
+    #[allow(unused_mut)]
+    let mut client_builder = reqwest::Client::builder();
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut client_builder =
+        client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
+
+    client_builder = match () {
+        #[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
+        () => client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames),
+        #[cfg(any(not(feature = "native-tls"), target_arch = "wasm32"))]
+        () => client_builder,
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if !config.tls_certs_only.is_empty() {
+            client_builder =
+                client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
+        }
+        client_builder =
+            client_builder.tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
+    }
+
+    if let Some(timeout) = config.read_timeout {
+        client_builder = client_builder.read_timeout(timeout);
+    }
+    if let Some(timeout) = config.connect_timeout {
+        client_builder = client_builder.connect_timeout(timeout);
+    }
+
+    client_builder = client_builder.user_agent(config.user_agent);
+
+    if let Some(proxy_addr) = &config.https_proxy {
+        let no_proxy = config
+            .no_proxy
+            .as_ref()
+            .and_then(|no_proxy| NoProxy::from_string(no_proxy));
+        let proxy = Proxy::https(proxy_addr)?.no_proxy(no_proxy);
+        client_builder = client_builder.proxy(proxy);
+    }
+
+    if let Some(proxy_addr) = &config.http_proxy {
+        let no_proxy = config
+            .no_proxy
+            .as_ref()
+            .and_then(|no_proxy| NoProxy::from_string(no_proxy));
+        let proxy = Proxy::http(proxy_addr)?.no_proxy(no_proxy);
+        client_builder = client_builder.proxy(proxy);
+    }
+
+    if let Some(resolver) = &config.dns_resolver {
+        client_builder = client_builder.dns_resolver(resolver.clone());
+    }
+
+    Ok(client_builder)
+}
+
 impl TryFrom<ClientConfig> for Client {
     type Error = OciDistributionError;
 
     fn try_from(config: ClientConfig) -> std::result::Result<Self, Self::Error> {
-        #[allow(unused_mut)]
-        let mut client_builder = reqwest::Client::builder();
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut client_builder =
-            client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
-
-        client_builder = match () {
-            #[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
-            () => client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames),
-            #[cfg(any(not(feature = "native-tls"), target_arch = "wasm32"))]
-            () => client_builder,
-        };
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if !config.tls_certs_only.is_empty() {
-                client_builder =
-                    client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
-            }
-            client_builder = client_builder
-                .tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
-        }
-
-        if let Some(timeout) = config.read_timeout {
-            client_builder = client_builder.read_timeout(timeout);
-        }
-        if let Some(timeout) = config.connect_timeout {
-            client_builder = client_builder.connect_timeout(timeout);
-        }
-
-        client_builder = client_builder.user_agent(config.user_agent);
-
-        if let Some(proxy_addr) = &config.https_proxy {
-            let no_proxy = config
-                .no_proxy
-                .as_ref()
-                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
-            let proxy = Proxy::https(proxy_addr)?.no_proxy(no_proxy);
-            client_builder = client_builder.proxy(proxy);
-        }
-
-        if let Some(proxy_addr) = &config.http_proxy {
-            let no_proxy = config
-                .no_proxy
-                .as_ref()
-                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
-            let proxy = Proxy::http(proxy_addr)?.no_proxy(no_proxy);
-            client_builder = client_builder.proxy(proxy);
-        }
-
-        if let Some(resolver) = &config.dns_resolver {
-            client_builder = client_builder.dns_resolver(resolver.clone());
-        }
-
-        client_builder = client_builder.redirect(no_scheme_downgrade_policy());
+        let client = configured_builder(&config)?
+            .redirect(no_scheme_downgrade_policy())
+            .build()?;
+        // Redirects off entirely, not merely origin-checked: this client only
+        // ever addresses a URL the registry chose, and a 3xx there is a second
+        // registry-chosen target that would replay the blob body to whatever
+        // host it names. Surfacing the 3xx as a status is the refusal.
+        let no_redirect_client = configured_builder(&config)?
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
         let push_chunk_size = config.push_chunk_size;
@@ -434,7 +497,8 @@ impl TryFrom<ClientConfig> for Client {
             tokens: TokenCache::new(default_token_expiration_secs),
             challenges: Arc::default(),
             token_flights: Arc::default(),
-            client: client_builder.build()?,
+            client,
+            no_redirect_client,
             push_chunk_size,
             // Explicit `auth_store` rather than `..Default::default()`: the
             // struct-update tail would eagerly build a throwaway `Client::default()`
@@ -1059,7 +1123,7 @@ impl Client {
                 if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(OciDistributionError::ServerError {
                         code: status.as_u16(),
-                        url: realm.to_string(),
+                        url: redacted_display_str(realm),
                         message: reason,
                     });
                 }
@@ -1704,7 +1768,7 @@ impl Client {
     async fn begin_push_monolithical_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_monolithical_session");
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1727,7 +1791,7 @@ impl Client {
     async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1752,13 +1816,14 @@ impl Client {
         let url = Url::parse_with_params(location, &[("digest", digest)])
             .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
         self.require_same_registry(image, url.as_str())?;
-        let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
-            .into_request_builder()
-            .header("Content-Length", 0)
-            .send()
-            .await?;
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.put(url.clone()))
+                .apply_auth(image, RegistryOperation::Push)
+                .await?
+                .into_request_builder()
+                .header("Content-Length", 0)
+                .send()
+                .await?;
         self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
             .await
     }
@@ -1792,7 +1857,7 @@ impl Client {
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         self.require_same_registry(image, &url)?;
-        let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.put(&url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1834,7 +1899,7 @@ impl Client {
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         self.require_same_registry(image, &url)?;
-        let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.put(&url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1884,14 +1949,15 @@ impl Client {
         );
 
         self.require_same_registry(image, location)?;
-        let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
-            .into_request_builder()
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?;
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.patch(location))
+                .apply_auth(image, RegistryOperation::Push)
+                .await?
+                .into_request_builder()
+                .headers(headers)
+                .body(body)
+                .send()
+                .await?;
 
         // The registry reports what it actually stored via `Range: [bytes=]0-<end>`
         // (inclusive, from byte 0 of the blob). Trusting our own offsets when the
@@ -1984,12 +2050,13 @@ impl Client {
         )
         .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
 
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url.clone()))
+                .apply_auth(image, RegistryOperation::Push)
+                .await?
+                .into_request_builder()
+                .send()
+                .await?;
 
         // A spec-conforming registry either mounts the blob (201) or, on a miss,
         // declines and opens a regular upload session (202) at the returned
@@ -2325,7 +2392,10 @@ impl Client {
                 res.status(),
             )))
         } else {
-            let url = res.url().to_string();
+            // Registry-chosen on both clients: the upload-session URL on the
+            // no-redirect one, the post-redirect URL on the general one. Only
+            // its origin was ever vetted, so path and query are still theirs.
+            let url = redacted_display_url(res.url());
             let code = res.status().as_u16();
             let message = res.text().await?;
             Err(OciDistributionError::ServerError { url, code, message })
@@ -2342,12 +2412,21 @@ impl Client {
     /// (CWE-918). Sending it unauthenticated would close only the first of
     /// those three, so a cross-host session URL is refused outright. Relative
     /// and same-host absolute `Location` values are unaffected.
+    ///
+    /// This check is on the `Location` *string*, so it holds for exactly one
+    /// hop on its own. Every caller therefore issues its request through
+    /// [`RequestBuilderWrapper::from_client_no_redirect`], which is what stops
+    /// a registry from answering the vetted request with a 3xx to the host the
+    /// string check just refused.
     fn require_same_registry(&self, image: &Reference, url: &str) -> Result<()> {
         if self.is_same_registry_origin(image, url) {
             return Ok(());
         }
         Err(OciDistributionError::CrossHostRefused {
-            url: url.to_string(),
+            // The refused URL is registry-chosen and reaches stderr, which in
+            // CI is a public log. Redacting at construction rather than at the
+            // `Display` impl leaves no caller able to reintroduce the raw form.
+            url: redacted_display_str(url),
             registry: image.resolve_registry().to_string(),
         })
     }
@@ -2366,16 +2445,39 @@ impl Client {
     /// granted to some other host: a registry deliberately configured as
     /// plaintext may name a plaintext realm, and an unrelated allowance must
     /// not be able to redirect a credential.
+    ///
+    /// A plaintext registry is not a blanket licence either. Declaring one host
+    /// plain HTTP admits an on-path attacker *on that host's traffic*; it does
+    /// not agree to that attacker naming an arbitrary internet host as the
+    /// realm and collecting the password there. So a plaintext realm on a
+    /// plaintext registry is accepted only on the registry's own authority, or
+    /// on a host that carries its own plain-HTTP allowance.
     fn require_secure_realm(&self, image: &Reference, realm: &str) -> Result<()> {
         let registry = image.resolve_registry();
-        if self.config.protocol.scheme_for(registry) != "https" {
+        let refuse = || {
+            Err(OciDistributionError::InsecureAuthRealm {
+                // Registry-supplied, and a realm may carry a query; same
+                // disclosure hazard as `CrossHostRefused`.
+                realm: redacted_display_str(realm),
+            })
+        };
+        let Ok(url) = Url::parse(realm) else {
+            return refuse();
+        };
+        if url.scheme() == "https" {
             return Ok(());
         }
-        match Url::parse(realm) {
-            Ok(url) if url.scheme() == "https" => Ok(()),
-            _ => Err(OciDistributionError::InsecureAuthRealm {
-                realm: realm.to_string(),
-            }),
+        if self.config.protocol.scheme_for(registry) == "https" {
+            return refuse();
+        }
+        match url_authority(&url) {
+            Some(authority)
+                if authority == registry
+                    || self.config.protocol.scheme_for(&authority) != "https" =>
+            {
+                Ok(())
+            }
+            _ => refuse(),
         }
     }
 
@@ -2384,16 +2486,28 @@ impl Client {
     ///
     /// Fails closed: a URL neither side can parse counts as a mismatch, and so
     /// does an opaque origin (a non-http(s) scheme).
+    ///
+    /// One relaxation, in the safe direction: a registry configured as plain
+    /// HTTP may hand out an `https` session URL on its own authority. That adds
+    /// transport security rather than removing it, so it is not the handoff
+    /// this check exists to catch. The reverse — an `https` registry naming an
+    /// `http` URL on the same host — stays a mismatch.
     fn is_same_registry_origin(&self, image: &Reference, url: &str) -> bool {
         let registry = image.resolve_registry();
         let scheme = self.config.protocol.scheme_for(registry);
-        match (
+        let (Ok(expected), Ok(actual)) = (
             Url::parse(&format!("{scheme}://{registry}/")),
             Url::parse(url),
-        ) {
-            (Ok(expected), Ok(actual)) => expected.origin() == actual.origin(),
-            _ => false,
+        ) else {
+            return false;
+        };
+        if expected.origin() == actual.origin() {
+            return true;
         }
+        scheme == "http"
+            && actual.scheme() == "https"
+            && expected.host() == actual.host()
+            && expected.port() == actual.port()
     }
 
     /// The URL a manifest response finally came from, warning when the client
@@ -2615,6 +2729,13 @@ const REDACTED_QUERY_PARAMS: &[&str] = &[
 /// end up in an error message a user pastes into a bug report. Parameter names
 /// survive, because knowing a request was signed is the diagnosis.
 fn redacted_display_url(url: &Url) -> String {
+    redact_url(url).to_string()
+}
+
+/// [`redacted_display_url`] as a `Url`, for the places that must store one
+/// rather than print it — notably `From<reqwest::Error>`, which rewrites the
+/// URL reqwest attached so that every renderer sees the redacted form.
+pub(crate) fn redact_url(url: &Url) -> Url {
     let mut url = url.clone();
     // Both fail only for a cannot-be-a-base URL, which has no userinfo to strip.
     let _ = url.set_username(""); // redaction: nothing to strip on an opaque URL
@@ -2637,7 +2758,31 @@ fn redacted_display_url(url: &Url) -> String {
             .collect();
         url.query_pairs_mut().clear().extend_pairs(masked);
     }
-    url.to_string()
+    url
+}
+
+/// [`redacted_display_url`] for a value that has not been parsed yet.
+///
+/// A string no URL parser accepts has no structure to redact and is returned
+/// as-is: it is what the operator needs to see to diagnose the refusal.
+fn redacted_display_str(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(parsed) => redacted_display_url(&parsed),
+        Err(_) => url.to_string(),
+    }
+}
+
+/// `host[:port]` as a registry name is spelled, or `None` for a URL with no
+/// host (`file:`, `data:`, and other cannot-be-a-base forms).
+///
+/// The default port is omitted, matching `Url`'s own normalization, so
+/// `https://reg:443` and `https://reg` yield the same name.
+fn url_authority(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
 }
 
 /// Refuses a manifest response whose declared type cannot be a manifest.
@@ -2824,6 +2969,41 @@ impl<'a> RequestBuilderWrapper<'a> {
         f: impl Fn(&reqwest::Client) -> RequestBuilder,
     ) -> RequestBuilderWrapper<'a> {
         let request_builder = f(&client.client);
+        RequestBuilderWrapper {
+            client,
+            request_builder,
+        }
+    }
+
+    /// Like [`from_client`], but on a client that never follows redirects.
+    ///
+    /// For the whole blob-upload flow — the `POST` that opens or mounts a
+    /// session, and every request addressed to the session URL it hands back.
+    ///
+    /// On the session URL the reason is that `require_same_registry` vets the
+    /// `Location` *string*: a followed 3xx is a second registry-chosen target
+    /// the string check never saw, and reqwest replays the request there, blob
+    /// body included, with only the credential stripped. Refusing to follow is
+    /// what makes the origin check hold for more than one hop.
+    ///
+    /// On the opening `POST` there is no `Location` yet, and that is precisely
+    /// the gap: the URL is minted from the `Reference`, so nothing about it is
+    /// registry-chosen, but a `3xx` relocates the request itself before any
+    /// check exists to run. A plaintext registry answering
+    /// `307 Location: http://169.254.169.254/…` gets a `POST` to an address the
+    /// caller never named (CWE-918). Credentials are not the exposure — reqwest
+    /// strips them cross-origin — the reachability is.
+    ///
+    /// Either way the 3xx surfaces as a status, which `extract_location_header`
+    /// reports as a `ServerError`. The spec permits a redirect on any endpoint,
+    /// but in practice registries use it for blob `GET`s handing off to storage;
+    /// on this endpoint the 202's own `Location` is the designed channel for
+    /// exactly that, so a 3xx here is redundant with it.
+    fn from_client_no_redirect(
+        client: &'a Client,
+        f: impl Fn(&reqwest::Client) -> RequestBuilder,
+    ) -> RequestBuilderWrapper<'a> {
+        let request_builder = f(&client.no_redirect_client);
         RequestBuilderWrapper {
             client,
             request_builder,
@@ -3162,18 +3342,28 @@ fn bundled_root_certificates() -> Vec<Certificate> {
 /// fine. Seeding the bundled roots takes the `Verifier::new_with_extra_roots`
 /// path, which never errors on an empty store and still merges the native store
 /// (`SSL_CERT_FILE` / `SSL_CERT_DIR`) on top.
-fn default_seeded_client() -> reqwest::Client {
+fn default_seeded_client(redirect: impl Fn() -> reqwest::redirect::Policy) -> reqwest::Client {
+    // A factory rather than a `Policy`, which is not `Clone`: every builder
+    // below mints its own, so the roots are the only thing that can degrade.
+    let with_policy = || reqwest::Client::builder().redirect(redirect());
     match convert_certificates(&bundled_root_certificates()) {
-        Ok(certs) => reqwest::Client::builder()
-            .tls_certs_merge(certs)
-            .build()
-            // ponytail: a seeded build cannot hit the empty-store error the roots
-            // exist to prevent; any other builder failure is genuinely exceptional,
-            // so fall back to the stock default (itself fine when a system store
-            // is present — the only case the seeded build could plausibly fail).
-            .unwrap_or_default(),
-        Err(_) => reqwest::Client::default(),
+        Ok(certs) => with_policy().tls_certs_merge(certs).build(),
+        // ponytail: the bundled roots are a compiled-in constant, so a
+        // conversion failure means there is no other set to reach for.
+        Err(_) => with_policy().build(),
     }
+    // Retry without the roots rather than falling straight through: the roots
+    // are the only input here a build can plausibly reject, and dropping them
+    // keeps the redirect policy that `unwrap_or_default` below would not.
+    .or_else(|_| with_policy().build())
+    // ponytail: this last resort IS policy-free — `reqwest::Client::default()`
+    // is a stock client that follows redirects. Nothing better exists: a
+    // `reqwest::Client` is only reachable through a builder, so a builder that
+    // refuses twice leaves this or a panic, and `Client::default()` panics
+    // anyway on the one host where a seeded build could plausibly fail (no
+    // system trust store). Named rather than claimed away — no test can reach
+    // it, because no input available here makes `build()` fail.
+    .unwrap_or_default()
 }
 
 impl Default for ClientConfig {
@@ -3562,6 +3752,76 @@ mod test {
         Ok(())
     }
 
+    /// Every construction path yields a client carrying a redirect policy, the
+    /// degradation fallback included.
+    ///
+    /// `Client::new` warns and falls back to `Default` when `try_from` errors,
+    /// and a `ClientConfig` field a caller fills from a user-supplied string —
+    /// `https_proxy` here — is enough to reach that arm. With the policy
+    /// installed only inside `try_from`, the fallback silently restored
+    /// reqwest's default: redirects followed, and the upload path following
+    /// them off the registry (CWE-636, fail-open on error).
+    ///
+    /// Asserted through reqwest's `Debug`, which prints `redirect_policy` only
+    /// when the policy is not the default one. It is the only seam reqwest
+    /// offers short of a TLS fixture; the failure direction is safe, because a
+    /// reqwest that stopped printing the field reds this test rather than
+    /// quietly passing it.
+    #[test]
+    fn no_construction_path_yields_a_client_without_a_redirect_policy() {
+        for (label, client) in [
+            ("Default", Client::default()),
+            (
+                "try_from",
+                Client::new(ClientConfig {
+                    ..Default::default()
+                }),
+            ),
+            (
+                // `Proxy::https` rejects this, so `try_from` errors and
+                // `Client::new` takes its degradation fallback.
+                "degradation fallback",
+                Client::new(ClientConfig {
+                    https_proxy: Some("not a proxy".to_string()),
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let pull = format!("{:?}", client.client);
+            assert!(
+                pull.contains(r#"redirect_policy: "Policy(Custom)""#),
+                "{label}'s pull client lost the no-scheme-downgrade policy: {pull}"
+            );
+            let upload = format!("{:?}", client.no_redirect_client);
+            assert!(
+                upload.contains(r#"redirect_policy: "Policy(None)""#),
+                "{label}'s upload client would follow a redirect: {upload}"
+            );
+        }
+    }
+
+    /// The refusal names a target the registry chose, so it is subject to the
+    /// same disclosure rule as every other registry-supplied URL this crate
+    /// prints.
+    #[test]
+    fn a_refused_downgrade_is_redacted_before_it_is_reported() -> anyhow::Result<()> {
+        let target = Url::parse("http://user:hunter2@collector.example.net/x?token=deadbeef")?;
+        let message = scheme_downgrade_refusal(&target);
+
+        for secret in ["hunter2", "deadbeef"] {
+            assert!(
+                !message.contains(secret),
+                "the refusal published {secret}: {message}"
+            );
+        }
+        assert!(
+            message.contains("collector.example.net"),
+            "the refusal dropped the host, leaving nothing to diagnose: {message}"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn plaintext_auth_realm_is_refused_for_an_https_registry() -> anyhow::Result<()> {
         let image = Reference::try_from(HELLO_IMAGE_TAG)?;
@@ -3583,13 +3843,40 @@ mod test {
         }
 
         // A registry deliberately configured as plaintext may name a plaintext
-        // realm - there is no credential to downgrade that the registry call
-        // itself did not already carry.
+        // realm on its OWN authority - there is no credential to downgrade that
+        // the registry call itself did not already carry - and may upgrade to
+        // https at any time.
         let plaintext = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec!["webassembly.azurecr.io".to_string()]),
             ..Default::default()
         });
-        plaintext.require_secure_realm(&image, "http://auth.example.com/token")?;
+        plaintext.require_secure_realm(&image, "http://webassembly.azurecr.io/token")?;
+        plaintext.require_secure_realm(&image, "https://auth.example.com/token")?;
+
+        // But it is not a licence to name an ARBITRARY plaintext host. The
+        // plaintext declaration admits an on-path attacker on this registry's
+        // own traffic; that attacker answering with a realm elsewhere would
+        // walk the user's password out to the open internet, which an https
+        // realm on the same hostile registry would not have done.
+        let err = plaintext
+            .require_secure_realm(&image, "http://collector.example.com/token")
+            .expect_err("a plaintext registry must not name a foreign plaintext realm");
+        assert!(
+            matches!(err, OciDistributionError::InsecureAuthRealm { realm: ref r }
+                if r == "http://collector.example.com/token"),
+            "unexpected error: {err:?}"
+        );
+
+        // Unless that host carries its own plain-HTTP allowance - a federated
+        // token service inside the same plaintext estate stays reachable.
+        let estate = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![
+                "webassembly.azurecr.io".to_string(),
+                "auth.example.com".to_string(),
+            ]),
+            ..Default::default()
+        });
+        estate.require_secure_realm(&image, "http://auth.example.com/token")?;
 
         // An allowance granted to a DIFFERENT host does not license a plaintext
         // realm for this one.
@@ -3676,6 +3963,82 @@ mod test {
             assert!(
                 matches!(err, OciDistributionError::CrossHostRefused { url: ref u, .. } if u == url),
                 "unexpected error for {url}: {err:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A registry declared plain HTTP that answers with an `https` session URL
+    /// on its own authority is upgrading, not handing off, so the origin check
+    /// admits it. Every other axis - host, port, and the reverse direction -
+    /// stays a mismatch.
+    #[test]
+    fn a_plaintext_registry_may_upgrade_its_own_session_url() -> anyhow::Result<()> {
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+        let plaintext = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec!["webassembly.azurecr.io".to_string()]),
+            ..Default::default()
+        });
+
+        plaintext.require_same_registry(
+            &image,
+            "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        )?;
+        plaintext.require_same_registry(
+            &image,
+            "http://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        )?;
+
+        for url in [
+            // Upgrading is not a licence to move host or port.
+            "https://evil.example.com/v2/hello-wasm/blobs/uploads/abc",
+            "https://webassembly.azurecr.io:8443/v2/hello-wasm/blobs/uploads/abc",
+        ] {
+            plaintext
+                .require_same_registry(&image, url)
+                .expect_err("the upgrade allowance must not widen host or port");
+        }
+
+        // The reverse direction is the hazard and stays refused: an https
+        // registry naming an http URL on its own host is a downgrade.
+        Client::default()
+            .require_same_registry(
+                &image,
+                "http://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+            )
+            .expect_err("a downgrade on the registry's own host must stay a mismatch");
+
+        Ok(())
+    }
+
+    /// A registry-chosen URL reaches the user's terminal - a CI job log in the
+    /// common case - so the refusal must not be the thing that publishes the
+    /// presigned signature the refusal exists to protect.
+    #[test]
+    fn a_refused_session_url_is_redacted_before_it_is_reported() -> anyhow::Result<()> {
+        let client = Client::default();
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+
+        let err = client
+            .require_same_registry(
+                &image,
+                "https://user:hunter2@bucket.s3.example/upload?X-Amz-Signature=deadbeef&partNumber=3",
+            )
+            .expect_err("a foreign session URL must be refused");
+
+        let rendered = err.to_string();
+        for secret in ["hunter2", "deadbeef"] {
+            assert!(
+                !rendered.contains(secret),
+                "the refusal published {secret}: {rendered}"
+            );
+        }
+        // Diagnosis survives redaction: the host and the parameter names stay.
+        for kept in ["bucket.s3.example", "X-Amz-Signature", "partNumber=3"] {
+            assert!(
+                rendered.contains(kept),
+                "the refusal dropped {kept}, leaving nothing to diagnose: {rendered}"
             );
         }
 
