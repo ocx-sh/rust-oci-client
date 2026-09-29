@@ -1077,10 +1077,12 @@ impl Client {
             ChallengeInfo::Unsupported => return basic_fallback(),
         };
 
-        // Allow for either push or pull authentication
         let scope = match operation {
             RegistryOperation::Pull => format!("repository:{}:pull", image.repository()),
             RegistryOperation::Push => format!("repository:{}:pull,push", image.repository()),
+            RegistryOperation::Delete => {
+                format!("repository:{}:pull,push,delete", image.repository())
+            }
         };
 
         let realm = challenge.realm.as_ref();
@@ -2151,6 +2153,44 @@ impl Client {
         ret
     }
 
+    /// Deletes the manifest a tag points at, removing that tag only.
+    ///
+    /// A reference carrying a digest is refused before any request: deleting by
+    /// digest removes every tag sharing it. `200` and `202` are success, read
+    /// before `validate_registry_response` (which accepts only `200`); any other
+    /// status is an error that keeps the HTTP status. The request goes through
+    /// `apply_auth`, never `send_authed`, so a `401` is returned, not retried:
+    /// a retry would re-mint a delete-scoped token on the registry's say-so.
+    ///
+    /// `auth` is stored for the registry like any other call taking it, so
+    /// `apply_auth` can mint a delete-scoped token when none is cached.
+    /// Redirects are not followed, so a registry cannot replay the DELETE at
+    /// another host; a `3xx` surfaces as its status.
+    pub async fn delete_manifest(&self, image: &Reference, auth: &RegistryAuth) -> Result<()> {
+        if image.digest().is_some() {
+            return Err(OciDistributionError::GenericError(Some(format!(
+                "refusing to delete {image}: a digest reference removes every tag sharing it"
+            ))));
+        }
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+        let url = self.to_v2_manifest_url(image);
+        debug!(?url, "delete manifest");
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.delete(&url))
+                .apply_auth(image, RegistryOperation::Delete)
+                .await?
+                .into_request_builder()
+                .send()
+                .await?;
+        let status = res.status();
+        if status == StatusCode::OK || status == StatusCode::ACCEPTED {
+            return Ok(());
+        }
+        let body = res.bytes().await?;
+        validate_registry_response(status, &body, &url)
+    }
+
     /// Native-only referrers lookup that distinguishes an unsupported registry
     /// from a supported one with zero referrers.
     ///
@@ -2696,6 +2736,7 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
             match serde_json::from_slice::<OciEnvelope>(body) {
                 // According to the OCI spec, we should see an error in the message body.
                 Ok(envelope) => Err(OciDistributionError::RegistryError {
+                    status: s.as_u16(),
                     envelope,
                     url: url.to_string(),
                 }),
@@ -5433,5 +5474,348 @@ mod test {
             .push_blob_stream(&reference, data_stream, data_hash, None)
             .await
             .expect_err("expected error when use_monolithic_push is true but size is None");
+    }
+
+    /// Manifest DELETE against an in-process registry that answers every DELETE with one canned
+    /// status and counts what reached it.
+    mod manifest_delete {
+        use std::collections::HashMap;
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use axum::extract::{Path, Query, State};
+        use axum::http::{header, HeaderMap, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::{any, delete, get};
+        use axum::Router;
+        use tokio::net::TcpListener;
+        use tokio::task::JoinHandle;
+
+        use crate::client::{Client, ClientConfig, ClientProtocol};
+        use crate::errors::{OciDistributionError, OciErrorCode};
+        use crate::secrets::RegistryAuth;
+        use crate::token_cache::RegistryOperation;
+        use crate::Reference;
+
+        const DIGEST: &str =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        struct Shared {
+            status: u16,
+            body: &'static str,
+            deletes: AtomicUsize,
+            elsewhere: AtomicUsize,
+            tags: Mutex<Vec<String>>,
+            scopes: Mutex<Vec<String>>,
+        }
+
+        struct Registry {
+            handle: JoinHandle<()>,
+            server: String,
+            shared: Arc<Shared>,
+        }
+
+        impl Drop for Registry {
+            fn drop(&mut self) {
+                self.handle.abort()
+            }
+        }
+
+        /// A bearer challenge that names this same host as the token realm, so a re-auth would be
+        /// possible if the client tried one.
+        fn challenge(headers: &HeaderMap) -> String {
+            let host = headers[header::HOST].to_str().unwrap();
+            format!("Bearer realm=\"http://{host}/token\",service=\"mock\"")
+        }
+
+        async fn ping(headers: HeaderMap) -> Response {
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, challenge(&headers))],
+            )
+                .into_response()
+        }
+
+        async fn token(
+            State(shared): State<Arc<Shared>>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Response {
+            shared.scopes.lock().unwrap().push(query["scope"].clone());
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"token":"minted"}"#,
+            )
+                .into_response()
+        }
+
+        async fn answer_delete(
+            State(shared): State<Arc<Shared>>,
+            Path(tag): Path<String>,
+            headers: HeaderMap,
+        ) -> Response {
+            shared.deletes.fetch_add(1, Ordering::SeqCst);
+            shared.tags.lock().unwrap().push(tag);
+            let status = StatusCode::from_u16(shared.status).unwrap();
+            let mut response = (status, shared.body).into_response();
+            if status == StatusCode::UNAUTHORIZED {
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    challenge(&headers).parse().unwrap(),
+                );
+            }
+            if status.is_redirection() {
+                response
+                    .headers_mut()
+                    .insert(header::LOCATION, "/elsewhere".parse().unwrap());
+            }
+            response
+        }
+
+        async fn elsewhere(State(shared): State<Arc<Shared>>) -> StatusCode {
+            shared.elsewhere.fetch_add(1, Ordering::SeqCst);
+            StatusCode::ACCEPTED
+        }
+
+        impl Registry {
+            async fn answering(status: u16, body: &'static str) -> Self {
+                let shared = Arc::new(Shared {
+                    status,
+                    body,
+                    deletes: AtomicUsize::new(0),
+                    elsewhere: AtomicUsize::new(0),
+                    tags: Mutex::default(),
+                    scopes: Mutex::default(),
+                });
+                let app = Router::new()
+                    .route("/v2/", get(ping))
+                    .route("/token", get(token))
+                    .route("/v2/repo/manifests/{reference}", delete(answer_delete))
+                    .route("/elsewhere", any(elsewhere))
+                    .with_state(shared.clone());
+                let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .await
+                    .unwrap();
+                let server = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+                let handle = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                Self {
+                    handle,
+                    server,
+                    shared,
+                }
+            }
+
+            fn client(&self) -> Client {
+                Client::new(ClientConfig {
+                    protocol: ClientProtocol::Http,
+                    ..Default::default()
+                })
+            }
+
+            fn tagged(&self) -> Reference {
+                format!("{}/repo:1.0", self.server).parse().unwrap()
+            }
+
+            fn deletes(&self) -> usize {
+                self.shared.deletes.load(Ordering::SeqCst)
+            }
+        }
+
+        #[tokio::test]
+        async fn a_200_or_202_answer_is_success_and_names_the_tag() {
+            for status in [200, 202] {
+                let registry = Registry::answering(status, "").await;
+                registry
+                    .client()
+                    .delete_manifest(&registry.tagged(), &RegistryAuth::Anonymous)
+                    .await
+                    .unwrap_or_else(|e| panic!("{status} must be success, got {e}"));
+                assert_eq!(registry.deletes(), 1);
+                assert_eq!(*registry.shared.tags.lock().unwrap(), ["1.0"]);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_reference_carrying_a_digest_is_refused_before_any_request() {
+            let registry = Registry::answering(202, "").await;
+            let client = registry.client();
+            let by_digest: Reference = format!("{}/repo@{DIGEST}", registry.server)
+                .parse()
+                .unwrap();
+            let tag_and_digest: Reference = format!("{}/repo:1.0@{DIGEST}", registry.server)
+                .parse()
+                .unwrap();
+
+            for reference in [by_digest, tag_and_digest] {
+                client
+                    .delete_manifest(&reference, &RegistryAuth::Anonymous)
+                    .await
+                    .expect_err("a digest delete would remove every tag sharing it");
+            }
+            assert_eq!(registry.deletes(), 0, "no request may reach the registry");
+        }
+
+        #[tokio::test]
+        async fn a_refused_delete_keeps_its_http_status_and_envelope_codes() {
+            const UNSUPPORTED: &str =
+                r#"{"errors":[{"code":"UNSUPPORTED","message":"The operation is unsupported."}]}"#;
+            const DIGEST_INVALID: &str = r#"{"errors":[{"code":"DIGEST_INVALID","message":"provided digest did not match"}]}"#;
+
+            for (status, body, code) in [
+                (405, UNSUPPORTED, OciErrorCode::Unsupported),
+                (400, UNSUPPORTED, OciErrorCode::Unsupported),
+                (400, DIGEST_INVALID, OciErrorCode::DigestInvalid),
+            ] {
+                let registry = Registry::answering(status, body).await;
+                let error = registry
+                    .client()
+                    .delete_manifest(&registry.tagged(), &RegistryAuth::Anonymous)
+                    .await
+                    .expect_err("a refused delete is an error");
+                match error {
+                    OciDistributionError::RegistryError {
+                        status: seen,
+                        envelope,
+                        ..
+                    } => {
+                        assert_eq!(seen, status);
+                        assert_eq!(envelope.errors[0].code, code);
+                    }
+                    other => panic!("{status} with an envelope must keep both, got {other:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_refused_delete_without_an_envelope_keeps_its_http_status() {
+            for status in [404, 405, 500] {
+                let registry = Registry::answering(status, "not json").await;
+                let error = registry
+                    .client()
+                    .delete_manifest(&registry.tagged(), &RegistryAuth::Anonymous)
+                    .await
+                    .expect_err("a refused delete is an error");
+                assert!(
+                    matches!(&error, OciDistributionError::ServerError { code, .. } if *code == status),
+                    "{status} without an envelope must keep its status, got {error:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_401_on_delete_is_returned_once_and_never_retried() {
+            let registry = Registry::answering(
+                401,
+                r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#,
+            )
+            .await;
+            let client = registry.client();
+            let reference = registry.tagged();
+            client
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Delete,
+                )
+                .await
+                .unwrap();
+            let exchanges = registry.shared.scopes.lock().unwrap().len();
+            assert_eq!(exchanges, 1, "the delete token is minted up front");
+
+            let error = client
+                .delete_manifest(&reference, &RegistryAuth::Anonymous)
+                .await
+                .expect_err("a 401 is an error");
+
+            assert!(
+                matches!(error, OciDistributionError::UnauthorizedError { .. }),
+                "got {error:?}"
+            );
+            assert_eq!(
+                registry.deletes(),
+                1,
+                "the challenge on a 401 must not trigger a re-auth retry of a DELETE"
+            );
+            assert_eq!(
+                registry.shared.scopes.lock().unwrap().len(),
+                exchanges,
+                "no token exchange may follow the 401"
+            );
+        }
+
+        /// A redirect is not followed, so the DELETE can never be replayed at a host the
+        /// caller did not name.
+        #[tokio::test]
+        async fn a_redirected_delete_is_not_followed() {
+            let registry = Registry::answering(307, "").await;
+
+            let error = registry
+                .client()
+                .delete_manifest(&registry.tagged(), &RegistryAuth::Anonymous)
+                .await
+                .expect_err("a redirect is an error");
+
+            assert!(
+                matches!(error, OciDistributionError::ServerError { code: 307, .. }),
+                "got {error:?}"
+            );
+            assert_eq!(registry.deletes(), 1);
+            assert_eq!(
+                registry.shared.elsewhere.load(Ordering::SeqCst),
+                0,
+                "the redirect target must receive no request"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_delete_token_asks_for_the_delete_scope_and_is_minted_apart_from_push() {
+            let registry = Registry::answering(202, "").await;
+            let client = registry.client();
+            let reference = registry.tagged();
+            let scopes = || registry.shared.scopes.lock().unwrap().clone();
+
+            client
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Delete,
+                )
+                .await
+                .unwrap();
+            assert_eq!(scopes(), ["repository:repo:pull,push,delete"]);
+
+            client
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Delete,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                scopes().len(),
+                1,
+                "the delete token is served from the cache"
+            );
+
+            client
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Push,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                scopes(),
+                [
+                    "repository:repo:pull,push,delete",
+                    "repository:repo:pull,push"
+                ],
+                "a cached delete token must not stand in for a push token"
+            );
+        }
     }
 }
