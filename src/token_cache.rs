@@ -72,6 +72,8 @@ pub enum RegistryOperation {
     Push,
     /// Authenticate for pull operations
     Pull,
+    /// Authenticate for deleting a manifest by tag
+    Delete,
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,5 +448,72 @@ mod tests {
                 .is_some(),
             "opaque bearer token should be cached"
         );
+    }
+
+    fn token_value(token: &RegistryTokenType) -> &str {
+        match token {
+            RegistryTokenType::Bearer(token) => token.token(),
+            RegistryTokenType::Basic(..) => "basic",
+        }
+    }
+
+    fn bearer(token: &str) -> RegistryTokenType {
+        RegistryTokenType::Bearer(RegistryToken::Token {
+            token: token.to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_delete_token_is_cached_apart_from_a_push_token() {
+        let cache = TokenCache::new(60);
+        let reference: Reference = "registry.test/owner/tool:1.0".parse().unwrap();
+
+        cache
+            .insert(&reference, RegistryOperation::Push, bearer("push-token"))
+            .await;
+        assert!(
+            cache
+                .get(&reference, RegistryOperation::Delete)
+                .await
+                .is_none(),
+            "a push token must never authorise a delete"
+        );
+
+        cache
+            .insert(
+                &reference,
+                RegistryOperation::Delete,
+                bearer("delete-token"),
+            )
+            .await;
+        let push = cache
+            .get(&reference, RegistryOperation::Push)
+            .await
+            .unwrap();
+        let delete = cache
+            .get(&reference, RegistryOperation::Delete)
+            .await
+            .unwrap();
+        assert_eq!(token_value(&push), "push-token");
+        assert_eq!(token_value(&delete), "delete-token");
+    }
+
+    #[tokio::test]
+    async fn a_delete_token_never_answers_a_pull() {
+        let cache = TokenCache::new(60);
+        let reference: Reference = "registry.test/owner/tool:1.0".parse().unwrap();
+
+        cache
+            .insert(
+                &reference,
+                RegistryOperation::Delete,
+                bearer("delete-token"),
+            )
+            .await;
+
+        assert!(cache
+            .get(&reference, RegistryOperation::Pull)
+            .await
+            .is_none());
     }
 }

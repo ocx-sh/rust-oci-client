@@ -71,6 +71,8 @@ pub enum OciDistributionError {
     /// OCI registry error
     #[error("Registry error: url {url}, envelope: {envelope}")]
     RegistryError {
+        /// HTTP status code of the response carrying the envelope
+        status: u16,
         /// List of errors returned the by the OCI registry
         envelope: OciEnvelope,
         /// Request URL
