@@ -1,0 +1,7 @@
+# Upstream rust-oci-client ships no rustfmt.toml and formats at rustfmt's
+# default width. This fork is vendored inside the ocx tree, where rustfmt's
+# upward config search would otherwise find ocx's own rustfmt.toml
+# (max_width = 120) and reformat every untouched line of this crate on the
+# first `cargo fmt`. Pinning the default here keeps a fork diff to the lines
+# the fork actually changed.
+max_width = 100

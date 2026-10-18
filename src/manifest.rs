@@ -483,6 +483,41 @@ pub struct Platform {
     pub features: Option<Vec<String>>,
 }
 
+impl PartialOrd for Platform {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A total order over exactly the fields `PartialEq` compares, so a `Platform`
+/// can key an ordered map.
+///
+/// Not derivable: `Arch` and `Os` come from `oci_spec` and implement neither
+/// `Ord` nor `PartialOrd`. Both are injective over their `Display` strings for
+/// every value a manifest can produce — an unrecognised name deserializes into
+/// `Other(name)` and prints back as `name`, and a recognised one never reaches
+/// `Other` — so ordering by that string agrees with equality.
+impl Ord for Platform {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.os.to_string(),
+            self.architecture.to_string(),
+            &self.os_version,
+            &self.os_features,
+            &self.variant,
+            &self.features,
+        )
+            .cmp(&(
+                other.os.to_string(),
+                other.architecture.to_string(),
+                &other.os_version,
+                &other.os_features,
+                &other.variant,
+                &other.features,
+            ))
+    }
+}
+
 impl std::fmt::Display for Platform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let os_version = self
@@ -562,6 +597,106 @@ mod test {
                 .as_ref()
                 .expect("annotations map")
                 .len()
+        );
+    }
+
+    /// Builds a `Platform` the way deserialization builds one: `os`/`architecture`
+    /// go through `Os`/`Arch`'s `From<&str>`, never `Other` constructed directly.
+    /// This is the "every value a manifest can produce" population the doc
+    /// comment on `impl Ord for Platform` claims `Eq` agreement over.
+    fn wire_platform(
+        os: &str,
+        architecture: &str,
+        variant: Option<&str>,
+        os_features: Option<&[&str]>,
+    ) -> Platform {
+        Platform {
+            architecture: architecture.into(),
+            os: os.into(),
+            os_version: None,
+            os_features: os_features.map(|features| {
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_string())
+                    .collect()
+            }),
+            variant: variant.map(str::to_string),
+            features: None,
+        }
+    }
+
+    #[test]
+    fn ord_agrees_with_eq_over_the_wire_constructible_value_space() {
+        // Recognized os/arch pairs, an `Other`-carrying os and arch
+        // (including the `any/any` sentinel OCX's `Platform::Any` produces),
+        // `os_features` absent/present/multi-valued/reordered, and `variant`
+        // absent/present.
+        let table = vec![
+            wire_platform("linux", "amd64", None, None),
+            wire_platform("linux", "arm64", None, None),
+            wire_platform("darwin", "amd64", None, None),
+            wire_platform("darwin", "arm64", None, None),
+            wire_platform("windows", "amd64", None, None),
+            wire_platform("any", "any", None, None),
+            wire_platform("haiku", "amd64", None, None),
+            wire_platform("linux", "riscv128", None, None),
+            wire_platform("linux", "amd64", Some("v8"), None),
+            wire_platform("linux", "arm64", Some("v8"), None),
+            wire_platform("linux", "amd64", None, Some(&["libc.glibc"])),
+            wire_platform("linux", "amd64", None, Some(&["libc.musl"])),
+            wire_platform("linux", "amd64", None, Some(&["libc.glibc", "libc.musl"])),
+            wire_platform("linux", "amd64", None, Some(&["libc.musl", "libc.glibc"])),
+        ];
+
+        for left in &table {
+            for right in &table {
+                let eq = left == right;
+                let ord_equal = left.cmp(right) == std::cmp::Ordering::Equal;
+                assert_eq!(
+                    eq, ord_equal,
+                    "Ord must agree with Eq for wire-constructible platforms: {left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_other_collision_pair_is_not_wire_constructible() {
+        // `Os::Other("linux")` and `Os::Linux` collide under `Ord` (both
+        // Display as "linux") but differ under `Eq` (different variants) -
+        // exactly the counter-example the `Ord` impl's doc comment carves out
+        // by scoping its guarantee to "every value a manifest can produce".
+        // Confirming the premise here, not only in prose, is the actual
+        // test: if `Os`/`Arch`'s `From<&str>` is ever taught a new
+        // recognized name that still maps into `Other`, this assertion
+        // fails and the doc comment's premise has quietly gone false for
+        // real wire data.
+        let recognized = wire_platform("linux", "amd64", None, None);
+        let constructed_other = Platform {
+            architecture: Arch::Amd64,
+            os: Os::Other("linux".to_string()),
+            os_version: None,
+            os_features: None,
+            variant: None,
+            features: None,
+        };
+
+        assert_ne!(
+            recognized, constructed_other,
+            "different Os variants must stay Eq-unequal"
+        );
+        assert_eq!(
+            recognized.cmp(&constructed_other),
+            std::cmp::Ordering::Equal,
+            "Display collision ('linux') makes them Ord-equal - the documented, deliberate carve-out"
+        );
+
+        // The premise that keeps the carve-out harmless: no value parsed
+        // from wire data ever takes this shape.
+        assert_eq!(
+            Os::from("linux"),
+            Os::Linux,
+            "the wire parser must never produce Os::Other for a recognized name"
         );
     }
 }

@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, trace, warn};
 
+use crate::auth_cache::{ChallengeCache, ChallengeInfo, TokenFlights};
 pub use crate::blob::*;
 use crate::config::ConfigFile;
 use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
@@ -35,7 +36,9 @@ use crate::manifest::{
 use crate::secrets::RegistryAuth;
 use crate::secrets::*;
 use crate::sha256_digest;
-use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::token_cache::{
+    RegistryOperation, RegistryToken, RegistryTokenType, TokenCache, TokenCacheKey,
+};
 use crate::Reference;
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
@@ -314,7 +317,18 @@ pub struct Client {
     auth_store: Arc<RwLock<HashMap<String, RegistryAuth>>>,
     /// Token cache for the client
     pub tokens: TokenCache,
+    // Host -> the `WWW-Authenticate` challenge `GET /v2/` answered with. Probed
+    // once per host rather than once per repository, and dropped wholesale when
+    // a `401` says what is cached for that host is stale.
+    challenges: Arc<ChallengeCache>,
+    // Token exchanges currently running, so N cold callers for one scope share
+    // one handshake instead of each running their own.
+    token_flights: Arc<TokenFlights>,
     client: reqwest::Client,
+    // The same configuration as `client`, minus redirect following. Requests
+    // addressed to a registry-supplied upload-session URL go through this one:
+    // see `RequestBuilderWrapper::from_client_no_redirect`.
+    no_redirect_client: reqwest::Client,
     push_chunk_size: usize,
 }
 
@@ -324,7 +338,10 @@ impl Default for Client {
             config: Arc::default(),
             auth_store: Arc::default(),
             tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
-            client: default_seeded_client(),
+            challenges: Arc::default(),
+            token_flights: Arc::default(),
+            client: default_seeded_client(no_scheme_downgrade_policy),
+            no_redirect_client: default_seeded_client(reqwest::redirect::Policy::none),
             push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
         }
     }
@@ -338,66 +355,172 @@ pub trait ClientConfigSource {
     fn client_config(&self) -> ClientConfig;
 }
 
+/// reqwest's default redirect limit, restated because a custom policy replaces
+/// the default wholesale rather than wrapping it.
+///
+/// Compared with `>`, not `>=`, for the same reason reqwest's own limit arm
+/// does (`reqwest-0.13.4/src/redirect.rs:132-136`): `previous` is pushed before
+/// the policy is consulted (`:315`) and its first entry is the original
+/// request, not a redirection. `>=` would have allowed nine hops while claiming
+/// ten.
+const MAX_REDIRECTS: usize = 10;
+
+/// Follows redirects like reqwest's default, except never from `https` to
+/// `http`.
+///
+/// reqwest already strips `Authorization` on a scheme-only change — its
+/// `cross_host` predicate compares scheme alongside host and port
+/// (`reqwest-0.13.4/src/redirect.rs:241-243`) — so the credential leak is not
+/// what this policy adds. It adds the other half: stripping a header is a
+/// *header* mitigation and the request still goes, so the URL, the request
+/// body, and the manifest or blob bytes travel to the plaintext target in the
+/// clear (CWE-319 on the request itself, not only CWE-522 on the header).
+/// Refusing the hop means nothing reaches that target at all.
+///
+/// The `redirect.rs` claim is version-dependent: reqwest 0.12's predicate has
+/// only the host and port terms, and a future version could drop the scheme
+/// term again. Re-check it on a reqwest bump rather than trusting this comment
+/// — if it ever regresses, the credential leak returns and this policy becomes
+/// the only thing closing it.
+///
+/// Redirects are load-bearing on the pull path — registries hand blobs off to
+/// CDNs that way — so refusing all of them (`Policy::none`) is not an option
+/// here, and `https_only` would break registries deliberately configured as
+/// plain HTTP. The upload path is the exception and does use `Policy::none`:
+/// see [`RequestBuilderWrapper::from_client_no_redirect`].
+fn no_scheme_downgrade_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if is_scheme_downgrade(attempt.previous().last(), attempt.url()) {
+            let refusal = scheme_downgrade_refusal(attempt.url());
+            return attempt.error(OciDistributionError::GenericError(Some(refusal)));
+        }
+        // `attempt.error`, never `attempt.stop`: stop hands the 3xx back as an
+        // `Ok` response (`redirect.rs:189-196`), which `error_for_status_ref`
+        // treats as success — so a blob behind an over-long chain would answer
+        // "exists" to a HEAD and the layer would never be uploaded. reqwest's
+        // own limit arm errors, and replacing the default policy must not
+        // quietly relax that.
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error(OciDistributionError::GenericError(Some(format!(
+                "too many redirects (limit {MAX_REDIRECTS})"
+            ))));
+        }
+        attempt.follow()
+    })
+}
+
+/// Whether following `next` would move a request from TLS to the clear.
+///
+/// The decision `no_scheme_downgrade_policy` is built on, factored out because
+/// `reqwest::redirect::Attempt` cannot be constructed outside reqwest, so the
+/// closure itself has no test seam.
+fn is_scheme_downgrade(previous: Option<&Url>, next: &Url) -> bool {
+    previous.is_some_and(|previous| previous.scheme() == "https" && next.scheme() == "http")
+}
+
+/// What a refused downgrade says, factored out for the same reason
+/// [`is_scheme_downgrade`] is: the closure has no test seam.
+///
+/// The target is registry-chosen — a downgrade to a collector carries whatever
+/// query that collector wants echoed — so it is redacted before it reaches a
+/// message the user pastes into a bug report.
+fn scheme_downgrade_refusal(target: &Url) -> String {
+    format!(
+        "refusing a redirect from HTTPS to plaintext {}",
+        redacted_display_url(target)
+    )
+}
+
+/// Everything a `ClientConfig` implies about the underlying HTTP client except
+/// its redirect policy.
+///
+/// Factored out because a `Client` holds two `reqwest::Client`s that differ on
+/// exactly that one axis, and a `reqwest::ClientBuilder` cannot be cloned. Any
+/// setting added here reaches both automatically; a setting applied to one
+/// builder only would silently make the upload path less configured than the
+/// rest of the client.
+fn configured_builder(config: &ClientConfig) -> Result<reqwest::ClientBuilder> {
+    #[allow(unused_mut)]
+    let mut client_builder = reqwest::Client::builder();
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut client_builder =
+        client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
+
+    client_builder = match () {
+        #[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
+        () => client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames),
+        #[cfg(any(not(feature = "native-tls"), target_arch = "wasm32"))]
+        () => client_builder,
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if !config.tls_certs_only.is_empty() {
+            client_builder =
+                client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
+        }
+        client_builder =
+            client_builder.tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
+    }
+
+    if let Some(timeout) = config.read_timeout {
+        client_builder = client_builder.read_timeout(timeout);
+    }
+    if let Some(timeout) = config.connect_timeout {
+        client_builder = client_builder.connect_timeout(timeout);
+    }
+
+    client_builder = client_builder.user_agent(config.user_agent);
+
+    if let Some(proxy_addr) = &config.https_proxy {
+        let no_proxy = config
+            .no_proxy
+            .as_ref()
+            .and_then(|no_proxy| NoProxy::from_string(no_proxy));
+        let proxy = Proxy::https(proxy_addr)?.no_proxy(no_proxy);
+        client_builder = client_builder.proxy(proxy);
+    }
+
+    if let Some(proxy_addr) = &config.http_proxy {
+        let no_proxy = config
+            .no_proxy
+            .as_ref()
+            .and_then(|no_proxy| NoProxy::from_string(no_proxy));
+        let proxy = Proxy::http(proxy_addr)?.no_proxy(no_proxy);
+        client_builder = client_builder.proxy(proxy);
+    }
+
+    if let Some(resolver) = &config.dns_resolver {
+        client_builder = client_builder.dns_resolver(resolver.clone());
+    }
+
+    Ok(client_builder)
+}
+
 impl TryFrom<ClientConfig> for Client {
     type Error = OciDistributionError;
 
     fn try_from(config: ClientConfig) -> std::result::Result<Self, Self::Error> {
-        #[allow(unused_mut)]
-        let mut client_builder = reqwest::Client::builder();
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut client_builder =
-            client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
-
-        client_builder = match () {
-            #[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
-            () => client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames),
-            #[cfg(any(not(feature = "native-tls"), target_arch = "wasm32"))]
-            () => client_builder,
-        };
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if !config.tls_certs_only.is_empty() {
-                client_builder =
-                    client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
-            }
-            client_builder = client_builder
-                .tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
-        }
-
-        if let Some(timeout) = config.read_timeout {
-            client_builder = client_builder.read_timeout(timeout);
-        }
-        if let Some(timeout) = config.connect_timeout {
-            client_builder = client_builder.connect_timeout(timeout);
-        }
-
-        client_builder = client_builder.user_agent(config.user_agent);
-
-        if let Some(proxy_addr) = &config.https_proxy {
-            let no_proxy = config
-                .no_proxy
-                .as_ref()
-                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
-            let proxy = Proxy::https(proxy_addr)?.no_proxy(no_proxy);
-            client_builder = client_builder.proxy(proxy);
-        }
-
-        if let Some(proxy_addr) = &config.http_proxy {
-            let no_proxy = config
-                .no_proxy
-                .as_ref()
-                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
-            let proxy = Proxy::http(proxy_addr)?.no_proxy(no_proxy);
-            client_builder = client_builder.proxy(proxy);
-        }
+        let client = configured_builder(&config)?
+            .redirect(no_scheme_downgrade_policy())
+            .build()?;
+        // Redirects off entirely, not merely origin-checked: this client only
+        // ever addresses a URL the registry chose, and a 3xx there is a second
+        // registry-chosen target that would replay the blob body to whatever
+        // host it names. Surfacing the 3xx as a status is the refusal.
+        let no_redirect_client = configured_builder(&config)?
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
         let push_chunk_size = config.push_chunk_size;
         Ok(Self {
             config: Arc::new(config),
             tokens: TokenCache::new(default_token_expiration_secs),
-            client: client_builder.build()?,
+            challenges: Arc::default(),
+            token_flights: Arc::default(),
+            client,
+            no_redirect_client,
             push_chunk_size,
             // Explicit `auth_store` rather than `..Default::default()`: the
             // struct-update tail would eagerly build a throwaway `Client::default()`
@@ -475,11 +598,7 @@ impl Client {
         let auth = self.auth_store.read().await.get(registry)?.clone();
         match self.tokens.get(reference, op).await {
             Some(token) => Some(token),
-            None => {
-                let token = self._auth(reference, &auth, op).await.ok()??;
-                self.tokens.insert(reference, op, token.clone()).await;
-                Some(token)
-            }
+            None => self.acquire_token(reference, &auth, op).await.ok()?,
         }
     }
 
@@ -524,12 +643,7 @@ impl Client {
             client: self,
             request_builder: self.client.get(&url).query(query),
         };
-        let res = request
-            .apply_auth(image, op)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res = request.send_authed(image, op).await?;
         let status = res.status();
         let next = link_header(&res);
         let body = res.bytes().await?;
@@ -607,11 +721,7 @@ impl Client {
     /// `Content-Length` — callers rely on a known size to build a
     /// valid OCI descriptor, and silently falling back to zero would
     /// corrupt the manifest.
-    pub async fn fetch_blob_size(
-        &self,
-        image: &Reference,
-        digest: &str,
-    ) -> Result<Option<u64>> {
+    pub async fn fetch_blob_size(&self, image: &Reference, digest: &str) -> Result<Option<u64>> {
         let Some(res) = self.head_blob_response(image, digest).await? else {
             return Ok(None);
         };
@@ -624,9 +734,7 @@ impl Client {
                 ))
             })?;
         let header_str = header.to_str().map_err(|e| {
-            OciDistributionError::GenericError(Some(format!(
-                "invalid Content-Length header: {e}"
-            )))
+            OciDistributionError::GenericError(Some(format!("invalid Content-Length header: {e}")))
         })?;
         let content_length = header_str.parse::<u64>().map_err(|e| {
             OciDistributionError::GenericError(Some(format!(
@@ -650,12 +758,7 @@ impl Client {
             request_builder: self.client.head(&url),
         };
 
-        let res = request
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res = request.send_authed(image, RegistryOperation::Pull).await?;
 
         match res.error_for_status_ref() {
             Ok(_) => Ok(Some(res)),
@@ -882,6 +985,22 @@ impl Client {
     ///
     /// This performs authorization and then stores the token internally to be used
     /// on other requests.
+    /// # Caching
+    ///
+    /// A live cached token for `(registry, repository, operation)` answers
+    /// without a single request. The [`store_auth_if_needed`] call above it is
+    /// **not** part of that shortcut and runs either way: it is the side effect
+    /// a later `apply_auth` reads to decide whether the request is
+    /// authenticated at all, so an early return placed before it makes a
+    /// cache-resolved pull go out anonymous and come back `401`.
+    ///
+    /// [`RegistryAuth::Bearer`] is excluded from the shortcut. `_auth` returns
+    /// the caller-supplied token without any request, so the cache saves
+    /// nothing there — while this is the only route by which a *rotated* bearer
+    /// token replaces the cached one, and short-circuiting would keep serving
+    /// the stale token until its recorded expiry.
+    ///
+    /// [`store_auth_if_needed`]: Client::store_auth_if_needed
     pub async fn auth(
         &self,
         image: &Reference,
@@ -890,27 +1009,73 @@ impl Client {
     ) -> Result<Option<String>> {
         self.store_auth_if_needed(image.resolve_registry(), authentication)
             .await;
-        // preserve old caching behavior
-        match self._auth(image, authentication, operation).await {
-            Ok(Some(RegistryTokenType::Bearer(token))) => {
-                self.tokens
-                    .insert(image, operation, RegistryTokenType::Bearer(token.clone()))
-                    .await;
-                Ok(Some(token.token().to_string()))
+
+        if !matches!(authentication, RegistryAuth::Bearer(_)) {
+            if let Some(token) = self.tokens.get(image, operation).await {
+                return Ok(bearer_value(&token));
             }
-            Ok(Some(RegistryTokenType::Basic(username, password))) => {
-                self.tokens
-                    .insert(
-                        image,
-                        operation,
-                        RegistryTokenType::Basic(username, password),
-                    )
-                    .await;
-                Ok(None)
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
         }
+
+        let token = self.acquire_token(image, authentication, operation).await?;
+        Ok(token.as_ref().and_then(bearer_value))
+    }
+
+    /// Runs the authentication handshake and caches what it yields, coalescing
+    /// concurrent cold callers on `(registry, repository, operation)`.
+    ///
+    /// This pair — the handshake and the cache write — is the unit that must be
+    /// coalesced. A refresh of an index or a multi-layer pull enters here N-wide
+    /// and cold, and every caller misses the token cache before any of them has
+    /// finished writing to it.
+    async fn acquire_token(
+        &self,
+        image: &Reference,
+        authentication: &RegistryAuth,
+        operation: RegistryOperation,
+    ) -> Result<Option<RegistryTokenType>> {
+        let key = TokenCacheKey::new(image, operation);
+        self.token_flights
+            .acquire(key, || async {
+                let token = self._auth(image, authentication, operation).await?;
+                if let Some(token) = &token {
+                    self.tokens.insert(image, operation, token.clone()).await;
+                }
+                Ok(token)
+            })
+            .await
+    }
+
+    /// The `WWW-Authenticate` challenge this host answers `GET /v2/` with,
+    /// probed once per host and shared by every repository under it.
+    ///
+    /// The probe URL is built from the registry alone, so its answer never
+    /// depended on the repository; caching it per host is what takes a
+    /// P-package sync from P probes to one. Staleness is handled by the `401`
+    /// path in `send_authed`, which drops the cached challenge and reseeds it
+    /// from the rejection's own header, not by re-probing.
+    async fn challenge_for(&self, registry: &str) -> Result<ChallengeInfo> {
+        // The version request will tell us where to go.
+        let url = format!(
+            "{}://{}/v2/",
+            self.config.protocol.scheme_for(registry),
+            registry
+        );
+        self.challenges
+            .get_or_probe(registry, || async {
+                debug!(?url, "Probing for an authentication challenge");
+                let res = self.client.get(&url).send().await?;
+                let Some(dist_hdr) = res.headers().get(reqwest::header::WWW_AUTHENTICATE) else {
+                    return Ok(ChallengeInfo::Unchallenged);
+                };
+                Ok(match BearerChallenge::try_from(dist_hdr) {
+                    Ok(challenge) => ChallengeInfo::Bearer(challenge),
+                    Err(e) => {
+                        debug!(error = ?e, "Falling back to HTTP Basic Auth");
+                        ChallengeInfo::Unsupported
+                    }
+                })
+            })
+            .await
     }
 
     /// Internal auth that retrieves token.
@@ -921,13 +1086,6 @@ impl Client {
         operation: RegistryOperation,
     ) -> Result<Option<RegistryTokenType>> {
         debug!("Authorizing for image: {:?}", image);
-        // The version request will tell us where to go.
-        let url = format!(
-            "{}://{}/v2/",
-            self.config.protocol.scheme_for(image.resolve_registry()),
-            image.resolve_registry()
-        );
-        debug!(?url);
 
         if let RegistryAuth::Bearer(token) = authentication {
             return Ok(Some(RegistryTokenType::Bearer(RegistryToken::Token {
@@ -935,33 +1093,33 @@ impl Client {
             })));
         }
 
-        let res = self.client.get(&url).send().await?;
-        let dist_hdr = match res.headers().get(reqwest::header::WWW_AUTHENTICATE) {
-            Some(h) => h,
-            None => return Ok(None),
+        let basic_fallback = || match authentication {
+            RegistryAuth::Basic(username, password) => Ok(Some(RegistryTokenType::Basic(
+                username.to_string(),
+                password.to_string(),
+            ))),
+            _ => Ok(None),
         };
 
-        let challenge = match BearerChallenge::try_from(dist_hdr) {
-            Ok(c) => c,
-            Err(e) => {
-                debug!(error = ?e, "Falling back to HTTP Basic Auth");
-                if let RegistryAuth::Basic(username, password) = authentication {
-                    return Ok(Some(RegistryTokenType::Basic(
-                        username.to_string(),
-                        password.to_string(),
-                    )));
-                }
-                return Ok(None);
-            }
+        let challenge = match self.challenge_for(image.resolve_registry()).await? {
+            ChallengeInfo::Bearer(challenge) => challenge,
+            // No challenge at all: nothing to exchange, and Basic credentials
+            // stay unused rather than being volunteered to a host that never
+            // asked for them — the pre-cache behaviour, unchanged.
+            ChallengeInfo::Unchallenged => return Ok(None),
+            ChallengeInfo::Unsupported => return basic_fallback(),
         };
 
-        // Allow for either push or pull authentication
         let scope = match operation {
             RegistryOperation::Pull => format!("repository:{}:pull", image.repository()),
             RegistryOperation::Push => format!("repository:{}:pull,push", image.repository()),
+            RegistryOperation::Delete => {
+                format!("repository:{}:pull,push,delete", image.repository())
+            }
         };
 
         let realm = challenge.realm.as_ref();
+        self.require_secure_realm(image, realm)?;
         let service = challenge.service.as_ref();
         let mut query = vec![("scope", &scope)];
 
@@ -1000,7 +1158,7 @@ impl Client {
                 if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(OciDistributionError::ServerError {
                         code: status.as_u16(),
-                        url: realm.to_string(),
+                        url: redacted_display_str(realm),
                         message: reason,
                     });
                 }
@@ -1029,10 +1187,7 @@ impl Client {
         debug!("HEAD image manifest from {}", url);
         let res = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
+            .send_authed(image, RegistryOperation::Pull)
             .await?;
 
         if let Some(digest) = digest_header_value(res.headers().clone())? {
@@ -1061,16 +1216,20 @@ impl Client {
             debug!("GET image manifest from {}", url);
             let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
                 .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                .apply_auth(image, RegistryOperation::Pull)
-                .await?
-                .into_request_builder()
-                .send()
+                .send_authed(image, RegistryOperation::Pull)
                 .await?;
             let status = res.status();
             trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
+            let final_url = self.note_manifest_redirect(image, &url, &res);
+            // Before the body is read: an HTML portal has no size a manifest
+            // reader should ever pull into memory. A non-200 keeps the old
+            // order — its body is the OCI error envelope.
+            if status == reqwest::StatusCode::OK {
+                validate_manifest_content_type(&headers, &final_url)?;
+            }
             let body = res.bytes().await?;
-            validate_registry_response(status, &body, &url)?;
+            validate_registry_response(status, &body, &final_url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
                 .map_err(OciDistributionError::from)
@@ -1258,16 +1417,20 @@ impl Client {
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(accepted_media_types)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
+            .send_authed(image, RegistryOperation::Pull)
             .await?;
         let status = res.status();
         let headers = res.headers().clone();
+        let final_url = self.note_manifest_redirect(image, &url, &res);
+        // Before the body is read: an HTML portal has no size a manifest reader
+        // should ever pull into memory. A non-200 keeps the old order — its
+        // body is the OCI error envelope.
+        if status == reqwest::StatusCode::OK {
+            validate_manifest_content_type(&headers, &final_url)?;
+        }
         let body = res.bytes().await?;
 
-        validate_registry_response(status, &body, &url)?;
+        validate_registry_response(status, &body, &final_url)?;
 
         let digest_header = digest_header_value(headers)?;
         let digest = validate_digest(&body, digest_header, image.digest())?;
@@ -1640,7 +1803,7 @@ impl Client {
     async fn begin_push_monolithical_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_monolithical_session");
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1663,7 +1826,7 @@ impl Client {
     async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1687,13 +1850,15 @@ impl Client {
     ) -> Result<String> {
         let url = Url::parse_with_params(location, &[("digest", digest)])
             .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
-        let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
-            .into_request_builder()
-            .header("Content-Length", 0)
-            .send()
-            .await?;
+        self.require_same_registry(image, url.as_str())?;
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.put(url.clone()))
+                .apply_auth(image, RegistryOperation::Push)
+                .await?
+                .into_request_builder()
+                .header("Content-Length", 0)
+                .send()
+                .await?;
         self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
             .await
     }
@@ -1726,7 +1891,8 @@ impl Client {
         );
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
-        let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
+        self.require_same_registry(image, &url)?;
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.put(&url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1750,7 +1916,8 @@ impl Client {
         layer: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
-        let mut url = Url::parse(location).unwrap();
+        let mut url =
+            Url::parse(location).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
         url.query_pairs_mut().append_pair("digest", blob_digest);
         let url = url.to_string();
 
@@ -1766,7 +1933,8 @@ impl Client {
         );
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
-        let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
+        self.require_same_registry(image, &url)?;
+        let res = RequestBuilderWrapper::from_client_no_redirect(self, |client| client.put(&url))
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
@@ -1800,28 +1968,55 @@ impl Client {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Range",
-            format!("{range_start}-{end_range_inclusive}").parse().unwrap(),
+            format!("{range_start}-{end_range_inclusive}")
+                .parse()
+                .unwrap(),
         );
         headers.insert("Content-Length", format!("{chunk_len}").parse().unwrap());
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
-        debug!(?range_start, ?end_range_inclusive, chunk_len, ?location, "Pushing chunk");
+        debug!(
+            ?range_start,
+            ?end_range_inclusive,
+            chunk_len,
+            ?location,
+            "Pushing chunk"
+        );
 
-        let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
-            .into_request_builder()
-            .headers(headers)
-            .body(body)
-            .send()
+        self.require_same_registry(image, location)?;
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.patch(location))
+                .apply_auth(image, RegistryOperation::Push)
+                .await?
+                .into_request_builder()
+                .headers(headers)
+                .body(body)
+                .send()
+                .await?;
+
+        // The registry reports what it actually stored via `Range: [bytes=]0-<end>`
+        // (inclusive, from byte 0 of the blob). Trusting our own offsets when the
+        // server accepted fewer bytes would send the next chunk at the wrong start,
+        // and the final PUT would then commit a blob that does not match the digest
+        // naming it. Neither body shape here can be rewound, so a disagreement is a
+        // hard stop: `SpecViolationError` is the variant callers already treat as
+        // "restart this blob", so `push_blob` retries it monolithically and
+        // `push_blob_stream`'s caller re-pushes from a fresh body.
+        let accepted_end = res.headers().get("Range").and_then(parse_range_end);
+        let next_location = self
+            .extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
             .await?;
+        match accepted_end {
+            Some(accepted_end) if accepted_end != end_range_inclusive => {
+                return Err(OciDistributionError::SpecViolationError(format!(
+                    "registry accepted bytes 0-{accepted_end} of the chunk sent as {range_start}-{end_range_inclusive}"
+                )));
+            }
+            _ => {}
+        }
 
         // Returns location for next chunk and the start byte for the next range
-        Ok((
-            self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
-                .await?,
-            end_range_inclusive + 1,
-        ))
+        Ok((next_location, end_range_inclusive + 1))
     }
 
     /// Pushes a single buffered chunk of a blob, as part of a chunked blob upload.
@@ -1890,12 +2085,13 @@ impl Client {
         )
         .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
 
-        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.post(url.clone()))
+                .apply_auth(image, RegistryOperation::Push)
+                .await?
+                .into_request_builder()
+                .send()
+                .await?;
 
         // A spec-conforming registry either mounts the blob (201) or, on a miss,
         // declines and opens a regular upload session (202) at the returned
@@ -1990,136 +2186,88 @@ impl Client {
         ret
     }
 
-    /// Pulls the referrers for the given image filtering by the optionally provided artifact type.
+    /// Deletes the manifest a tag points at, removing that tag only.
     ///
-    /// Implements the [OCI Distribution Spec referrers API][oci-referrers] with an automatic
-    /// fallback to the [referrers tag schema][oci-tag-schema] when the registry returns a
-    /// `404 Not Found` for the native endpoint (as required by the spec).
+    /// A reference carrying a digest is refused before any request: deleting by
+    /// digest removes every tag sharing it. `200` and `202` are success, read
+    /// before `validate_registry_response` (which accepts only `200`); any other
+    /// status is an error that keeps the HTTP status. The request goes through
+    /// `apply_auth`, never `send_authed`, so a `401` is returned, not retried:
+    /// a retry would re-mint a delete-scoped token on the registry's say-so.
     ///
-    /// Many registries (e.g. ghcr.io) do not implement the native
-    /// `/v2/<name>/referrers/<digest>` endpoint and return 404 instead. The OCI spec
-    /// defines a fallback: the referrers index is stored as a regular OCI Image Index
-    /// under a tag derived from the subject digest by replacing `:` with `-`
-    /// (e.g. `sha256:abc…` → tag `sha256-abc…`).
+    /// `auth` is stored for the registry like any other call taking it, so
+    /// `apply_auth` can mint a delete-scoped token when none is cached.
+    /// Redirects are not followed, so a registry cannot replay the DELETE at
+    /// another host; a `3xx` surfaces as its status.
+    pub async fn delete_manifest(&self, image: &Reference, auth: &RegistryAuth) -> Result<()> {
+        if image.digest().is_some() {
+            return Err(OciDistributionError::GenericError(Some(format!(
+                "refusing to delete {image}: a digest reference removes every tag sharing it"
+            ))));
+        }
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+        let url = self.to_v2_manifest_url(image);
+        debug!(?url, "delete manifest");
+        let res =
+            RequestBuilderWrapper::from_client_no_redirect(self, |client| client.delete(&url))
+                .apply_auth(image, RegistryOperation::Delete)
+                .await?
+                .into_request_builder()
+                .send()
+                .await?;
+        let status = res.status();
+        if status == StatusCode::OK || status == StatusCode::ACCEPTED {
+            return Ok(());
+        }
+        let body = res.bytes().await?;
+        validate_registry_response(status, &body, &url)
+    }
+
+    /// Native-only referrers lookup that distinguishes an unsupported registry
+    /// from a supported one with zero referrers.
     ///
-    /// When the fallback is used, `artifact_type` filtering is applied client-side,
-    /// since the tag schema stores a single unfiltered index with no query-parameter
-    /// support.
-    ///
-    /// If both the native API and the tag schema fail, an empty `OciImageIndex` is
-    /// returned, as per the spec recommendation.
-    ///
-    /// [oci-referrers]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
-    /// [oci-tag-schema]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema
-    pub async fn pull_referrers(
+    /// This does NOT fall back to the referrers tag schema: it performs only the
+    /// native `/v2/<name>/referrers/<digest>` GET. A `404` on that endpoint
+    /// returns `Ok(None)` — the registry does not implement the native OCI 1.1
+    /// Referrers API. A `200` returns `Ok(Some(index))` (supported; the index may
+    /// be empty). Any other status is an error. A caller that wants the OCI-spec
+    /// tag-schema fallback owns that fallback itself; this method's job is to
+    /// report the capability verdict, so "unsupported" stays distinguishable from
+    /// "supported, no referrers".
+    pub async fn pull_referrers_native(
         &self,
         image: &Reference,
         artifact_type: Option<&str>,
-    ) -> Result<OciImageIndex> {
+    ) -> Result<Option<OciImageIndex>> {
         let url = self.to_v2_referrers_url(image, artifact_type)?;
-        debug!("Pulling referrers from {}", url);
+        debug!("Pulling referrers (native-only) from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
+            .send_authed(image, RegistryOperation::Pull)
             .await?;
         let status = res.status();
-        let body = res.bytes().await?;
-
-        // Per the OCI Distribution Spec, a 404 on the native referrers endpoint means the
-        // registry does not support it; fall back to the referrers tag schema.
         if status == reqwest::StatusCode::NOT_FOUND {
-            debug!(
-                url = %url,
-                "Native referrers API returned 404; falling back to OCI referrers tag schema"
-            );
-            return self
-                .pull_referrers_via_tag_schema(image, artifact_type)
-                .await;
+            return Ok(None);
         }
 
+        let body = read_body_bounded(res, &url, MAX_REFERRERS_INDEX_BYTES).await?;
         validate_registry_response(status, &body, &url)?;
-        let manifest = serde_json::from_slice(&body)
+        let manifest: OciImageIndex = serde_json::from_slice(&body)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
 
-        Ok(manifest)
-    }
-
-    /// Pulls the referrers index using the OCI referrers tag schema fallback.
-    ///
-    /// The tag is the subject digest with `:` replaced by `-`
-    /// (e.g. `sha256:abc…` → `sha256-abc…`).
-    ///
-    /// If `artifact_type` is provided, the returned index is filtered client-side
-    /// to include only entries whose `artifact_type` matches.
-    ///
-    /// If the tag does not exist or does not contain a valid image index, an empty
-    /// `OciImageIndex` is returned as per the OCI spec recommendation.
-    async fn pull_referrers_via_tag_schema(
-        &self,
-        image: &Reference,
-        artifact_type: Option<&str>,
-    ) -> Result<OciImageIndex> {
-        let digest = image.digest().ok_or_else(|| {
-            OciDistributionError::GenericError(Some(
-                "Getting referrers for a tag is not supported".into(),
-            ))
-        })?;
-
-        let fallback_tag = digest.replace(':', "-");
-        let fallback_ref = Reference::with_tag(
-            image.resolve_registry().to_string(),
-            image.repository().to_string(),
-            fallback_tag.clone(),
-        );
-
-        debug!(
-            tag = %fallback_tag,
-            "Pulling referrers via tag schema"
-        );
-
-        let manifest = match self._pull_manifest(&fallback_ref).await {
-            Ok((manifest, _digest)) => manifest,
-            Err(e) => match &e {
-                OciDistributionError::ImageManifestNotFoundError(_)
-                | OciDistributionError::RegistryError { .. }
-                | OciDistributionError::ServerError { code: 404, .. } => {
-                    debug!(
-                        error = ?e,
-                        "Referrers tag schema not found; assuming no referrers"
-                    );
-                    return Ok(empty_image_index());
-                }
-                _ => return Err(e),
-            },
-        };
-
-        let mut index = match manifest {
-            OciManifest::ImageIndex(idx) => idx,
-            OciManifest::Image(_) => {
-                return Err(OciDistributionError::SpecViolationError(format!(
-                    "referrers tag schema: tag '{fallback_tag}' contains an Image manifest; \
-                     expected an OCI Image Index"
-                )));
-            }
-        };
-
-        // Apply client-side artifact_type filtering when requested, since the tag
-        // schema stores a single unfiltered index.
-        if let Some(at) = artifact_type {
-            index.manifests.retain(|entry| {
-                entry
-                    .artifact_type
-                    .as_deref()
-                    .map(|t| t == at)
-                    .unwrap_or(false)
-            });
+        // The byte cap alone does not bound the work a caller does per entry, and
+        // a compact descriptor is ~200 bytes: 4 MiB of them is tens of thousands
+        // of signatures to fetch and verify for one subject.
+        if manifest.manifests.len() > MAX_REFERRERS_DESCRIPTORS {
+            return Err(OciDistributionError::SpecViolationError(format!(
+                "referrers index at {url} lists {} descriptors, above the {MAX_REFERRERS_DESCRIPTORS} limit",
+                manifest.manifests.len()
+            )));
         }
 
-        Ok(index)
+        Ok(Some(manifest))
     }
 
     /// Lists available repositories in the registry.
@@ -2166,12 +2314,7 @@ impl Client {
             client: self,
             request_builder: self.client.get(&url).query(query),
         };
-        let res = request
-            .apply_auth(image, op)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let res = request.send_authed(image, op).await?;
         let status = res.status();
         let next = link_header(&res);
         let body = res.bytes().await?;
@@ -2205,11 +2348,145 @@ impl Client {
                 res.status(),
             )))
         } else {
-            let url = res.url().to_string();
+            // Registry-chosen on both clients: the upload-session URL on the
+            // no-redirect one, the post-redirect URL on the general one. Only
+            // its origin was ever vetted, so path and query are still theirs.
+            let url = redacted_display_url(res.url());
             let code = res.status().as_u16();
             let message = res.text().await?;
             Err(OciDistributionError::ServerError { url, code, message })
         }
+    }
+
+    /// Refuses a registry-supplied URL that is not on the reference's own
+    /// registry.
+    ///
+    /// An upload session's URL comes from a registry-controlled `Location`
+    /// header, so it can name any host. Following it hands that host this
+    /// registry's credentials (CWE-522 / CWE-200), the blob body, and a
+    /// request the caller never addressed — an internal address included
+    /// (CWE-918). Sending it unauthenticated would close only the first of
+    /// those three, so a cross-host session URL is refused outright. Relative
+    /// and same-host absolute `Location` values are unaffected.
+    ///
+    /// This check is on the `Location` *string*, so it holds for exactly one
+    /// hop on its own. Every caller therefore issues its request through
+    /// [`RequestBuilderWrapper::from_client_no_redirect`], which is what stops
+    /// a registry from answering the vetted request with a 3xx to the host the
+    /// string check just refused.
+    fn require_same_registry(&self, image: &Reference, url: &str) -> Result<()> {
+        if self.is_same_registry_origin(image, url) {
+            return Ok(());
+        }
+        Err(OciDistributionError::CrossHostRefused {
+            // The refused URL is registry-chosen and reaches stderr, which in
+            // CI is a public log. Redacting at construction rather than at the
+            // `Display` impl leaves no caller able to reintroduce the raw form.
+            url: redacted_display_str(url),
+            registry: image.resolve_registry().to_string(),
+        })
+    }
+
+    /// Refuses a token-service realm that would carry credentials in the clear.
+    ///
+    /// The realm comes verbatim from the registry's `WWW-Authenticate` header
+    /// and is fetched with the user's Basic credentials attached, so a registry
+    /// answering `realm="http://…"` collects the password in cleartext
+    /// (CWE-522 / CWE-319). A cross-*host* realm is legitimate and stays
+    /// allowed — federated token services are how Docker Hub works
+    /// (`registry-1.docker.io` → `auth.docker.io`) — but a registry we reached
+    /// over HTTPS may not hand its credentials to a plaintext one.
+    ///
+    /// Keyed on this registry's own scheme, never on a plain-HTTP allowance
+    /// granted to some other host: a registry deliberately configured as
+    /// plaintext may name a plaintext realm, and an unrelated allowance must
+    /// not be able to redirect a credential.
+    ///
+    /// A plaintext registry is not a blanket licence either. Declaring one host
+    /// plain HTTP admits an on-path attacker *on that host's traffic*; it does
+    /// not agree to that attacker naming an arbitrary internet host as the
+    /// realm and collecting the password there. So a plaintext realm on a
+    /// plaintext registry is accepted only on the registry's own authority, or
+    /// on a host that carries its own plain-HTTP allowance.
+    fn require_secure_realm(&self, image: &Reference, realm: &str) -> Result<()> {
+        let registry = image.resolve_registry();
+        let refuse = || {
+            Err(OciDistributionError::InsecureAuthRealm {
+                // Registry-supplied, and a realm may carry a query; same
+                // disclosure hazard as `CrossHostRefused`.
+                realm: redacted_display_str(realm),
+            })
+        };
+        let Ok(url) = Url::parse(realm) else {
+            return refuse();
+        };
+        if url.scheme() == "https" {
+            return Ok(());
+        }
+        if self.config.protocol.scheme_for(registry) == "https" {
+            return refuse();
+        }
+        match url_authority(&url) {
+            Some(authority)
+                if authority == registry
+                    || self.config.protocol.scheme_for(&authority) != "https" =>
+            {
+                Ok(())
+            }
+            _ => refuse(),
+        }
+    }
+
+    /// Whether `url` shares the origin (scheme, host, port) the image reference
+    /// resolves to.
+    ///
+    /// Fails closed: a URL neither side can parse counts as a mismatch, and so
+    /// does an opaque origin (a non-http(s) scheme).
+    ///
+    /// One relaxation, in the safe direction: a registry configured as plain
+    /// HTTP may hand out an `https` session URL on its own authority. That adds
+    /// transport security rather than removing it, so it is not the handoff
+    /// this check exists to catch. The reverse — an `https` registry naming an
+    /// `http` URL on the same host — stays a mismatch.
+    fn is_same_registry_origin(&self, image: &Reference, url: &str) -> bool {
+        let registry = image.resolve_registry();
+        let scheme = self.config.protocol.scheme_for(registry);
+        let (Ok(expected), Ok(actual)) = (
+            Url::parse(&format!("{scheme}://{registry}/")),
+            Url::parse(url),
+        ) else {
+            return false;
+        };
+        if expected.origin() == actual.origin() {
+            return true;
+        }
+        scheme == "http"
+            && actual.scheme() == "https"
+            && expected.host() == actual.host()
+            && expected.port() == actual.port()
+    }
+
+    /// The URL a manifest response finally came from, warning when the client
+    /// was redirected off the registry's own origin.
+    ///
+    /// Every error raised about a manifest response must name this URL rather
+    /// than the one the request was addressed to: a mirror or proxy that
+    /// redirects to a login portal is otherwise indistinguishable from the
+    /// registry answering nonsense. The origin comparison includes the scheme,
+    /// so a plain http -> https upgrade warns too; that is deliberate, since
+    /// the point is visibility and the warning costs nothing.
+    fn note_manifest_redirect(&self, image: &Reference, url: &str, res: &Response) -> String {
+        // The origin comparison runs on the raw URL; only what is displayed is
+        // redacted, so a credential can never widen the same-origin decision.
+        let safe_url = redacted_display_url(res.url());
+        if !self.is_same_registry_origin(image, res.url().as_str()) {
+            warn!(
+                request = %url,
+                redirected_to = %safe_url,
+                "manifest request left the registry origin"
+            );
+        }
+        safe_url
     }
 
     /// Helper function to convert location header to URL
@@ -2340,9 +2617,168 @@ fn link_header(res: &reqwest::Response) -> Option<String> {
     (!links.is_empty()).then(|| links.join(", "))
 }
 
+/// Parses the inclusive end offset out of an upload-progress `Range` header.
+///
+/// Registries answer a chunk `PATCH` with the range they have stored so far,
+/// counted from byte 0 of the blob — `0-1023`, and with the optional unit prefix
+/// `bytes=0-1023`. Anything else (a missing start, a non-numeric end, a start
+/// other than 0) yields `None`, which the caller reads as "the registry did not
+/// report progress" rather than as a disagreement.
+fn parse_range_end(header: &reqwest::header::HeaderValue) -> Option<usize> {
+    let value = header.to_str().ok()?.trim();
+    let value = value.strip_prefix("bytes=").unwrap_or(value);
+    let (start, end) = value.split_once('-')?;
+    (start.trim() == "0").then_some(())?;
+    end.trim().parse().ok()
+}
+
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
 /// Obviously, HTTP servers are going to send other codes. This tries to catch the
 /// obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
+/// Byte ceiling on a referrers index response.
+///
+/// Nothing in the distribution spec bounds this body: its length is a function
+/// of how many artifacts the registry claims refer to the subject. 4 MiB is far
+/// above any real index and far below a memory-pressure event.
+const MAX_REFERRERS_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Descriptor-count ceiling on a referrers index.
+const MAX_REFERRERS_DESCRIPTORS: usize = 4096;
+
+/// Read a response body, refusing anything past `limit` bytes.
+///
+/// `Response::bytes` buffers whatever the peer sends, so it is not usable on a
+/// registry-controlled body with no protocol-level length bound. The declared
+/// `Content-Length` is treated as a hint worth refusing early on, never as the
+/// bound — the bound is the bytes actually counted through the stream.
+async fn read_body_bounded(response: Response, url: &str, limit: u64) -> Result<Vec<u8>> {
+    let too_large = || OciDistributionError::ResponseTooLargeError {
+        url: url.to_string(),
+        limit,
+    };
+
+    if let Some(declared) = response.content_length() {
+        if declared > limit {
+            return Err(too_large());
+        }
+    }
+
+    // Sized from the hint only after it has been clamped, so a hostile
+    // Content-Length cannot drive the allocation.
+    let hint = response.content_length().unwrap_or(0).min(limit);
+    let mut body = Vec::with_capacity(hint as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Query parameter names whose value is a credential in every scheme that uses
+/// them — presigned S3/GCS/Azure URLs and the registry token exchange.
+const REDACTED_QUERY_PARAMS: &[&str] = &[
+    "x-amz-signature",
+    "x-amz-credential",
+    "signature",
+    "sig",
+    "token",
+    "access_token",
+];
+
+/// A URL safe to print, with userinfo dropped and signed-query values masked.
+///
+/// A redirect target is chosen by the registry, so anything displayed from it
+/// is attacker-influenced: a blob redirect to presigned storage carries its
+/// signature in the query, and a proxy can send credentials in userinfo. Both
+/// end up in an error message a user pastes into a bug report. Parameter names
+/// survive, because knowing a request was signed is the diagnosis.
+fn redacted_display_url(url: &Url) -> String {
+    redact_url(url).to_string()
+}
+
+/// [`redacted_display_url`] as a `Url`, for the places that must store one
+/// rather than print it — notably `From<reqwest::Error>`, which rewrites the
+/// URL reqwest attached so that every renderer sees the redacted form.
+pub(crate) fn redact_url(url: &Url) -> Url {
+    let mut url = url.clone();
+    // Both fail only for a cannot-be-a-base URL, which has no userinfo to strip.
+    let _ = url.set_username(""); // redaction: nothing to strip on an opaque URL
+    let _ = url.set_password(None); // redaction: same
+
+    if url.query().is_some() {
+        let masked: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(name, value)| {
+                let value = if REDACTED_QUERY_PARAMS
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                {
+                    "***".to_string()
+                } else {
+                    value.into_owned()
+                };
+                (name.into_owned(), value)
+            })
+            .collect();
+        url.query_pairs_mut().clear().extend_pairs(masked);
+    }
+    url
+}
+
+/// [`redacted_display_url`] for a value that has not been parsed yet.
+///
+/// A string no URL parser accepts has no structure to redact and is returned
+/// as-is: it is what the operator needs to see to diagnose the refusal.
+fn redacted_display_str(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(parsed) => redacted_display_url(&parsed),
+        Err(_) => url.to_string(),
+    }
+}
+
+/// `host[:port]` as a registry name is spelled, or `None` for a URL with no
+/// host (`file:`, `data:`, and other cannot-be-a-base forms).
+///
+/// The default port is omitted, matching `Url`'s own normalization, so
+/// `https://reg:443` and `https://reg` yield the same name.
+fn url_authority(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+/// Refuses a manifest response whose declared type cannot be a manifest.
+///
+/// Runs on manifest GET paths only — a blob carries arbitrary content, and a
+/// HEAD answer carries no body to mistype. Registries legitimately omit the
+/// header, and the digest check still covers those bytes, so an absent header
+/// is admitted; anything present must be JSON.
+fn validate_manifest_content_type(headers: &HeaderMap, url: &str) -> Result<()> {
+    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
+        return Ok(());
+    };
+    let declared = String::from_utf8_lossy(value.as_bytes()).into_owned();
+    let essence = declared
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if essence == "application/json" || essence.ends_with("+json") {
+        return Ok(());
+    }
+    Err(OciDistributionError::UnexpectedContentType {
+        content_type: declared,
+        url: url.to_string(),
+    })
+}
+
 fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &str) -> Result<()> {
     match status {
         reqwest::StatusCode::OK => Ok(()),
@@ -2358,6 +2794,7 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
             match serde_json::from_slice::<OciEnvelope>(body) {
                 // According to the OCI spec, we should see an error in the message body.
                 Ok(envelope) => Err(OciDistributionError::RegistryError {
+                    status: s.as_u16(),
                     envelope,
                     url: url.to_string(),
                 }),
@@ -2378,17 +2815,6 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
                 message: text.to_string(),
             })
         }
-    }
-}
-
-/// Returns an empty OCI Image Index, as used when no referrers exist.
-fn empty_image_index() -> OciImageIndex {
-    OciImageIndex {
-        schema_version: 2,
-        media_type: Some(crate::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-        artifact_type: None,
-        annotations: None,
-        manifests: vec![],
     }
 }
 
@@ -2466,8 +2892,20 @@ impl AsyncRead for SharedReader {
         // Recover from a poisoned lock rather than panic across the `AsyncRead`
         // boundary: poisoning means a wrapped reader panicked mid-poll, but the
         // reader value itself is intact, so continue with it.
-        let mut reader = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut reader = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         reader.as_mut().poll_read(cx, buf)
+    }
+}
+
+/// What [`Client::auth`] reports to its caller: the bearer token, or `None`
+/// for Basic credentials, which the caller already holds.
+fn bearer_value(token: &RegistryTokenType) -> Option<String> {
+    match token {
+        RegistryTokenType::Bearer(token) => Some(token.token().to_string()),
+        RegistryTokenType::Basic(..) => None,
     }
 }
 
@@ -2489,6 +2927,41 @@ impl<'a> RequestBuilderWrapper<'a> {
         f: impl Fn(&reqwest::Client) -> RequestBuilder,
     ) -> RequestBuilderWrapper<'a> {
         let request_builder = f(&client.client);
+        RequestBuilderWrapper {
+            client,
+            request_builder,
+        }
+    }
+
+    /// Like [`from_client`], but on a client that never follows redirects.
+    ///
+    /// For the whole blob-upload flow — the `POST` that opens or mounts a
+    /// session, and every request addressed to the session URL it hands back.
+    ///
+    /// On the session URL the reason is that `require_same_registry` vets the
+    /// `Location` *string*: a followed 3xx is a second registry-chosen target
+    /// the string check never saw, and reqwest replays the request there, blob
+    /// body included, with only the credential stripped. Refusing to follow is
+    /// what makes the origin check hold for more than one hop.
+    ///
+    /// On the opening `POST` there is no `Location` yet, and that is precisely
+    /// the gap: the URL is minted from the `Reference`, so nothing about it is
+    /// registry-chosen, but a `3xx` relocates the request itself before any
+    /// check exists to run. A plaintext registry answering
+    /// `307 Location: http://169.254.169.254/…` gets a `POST` to an address the
+    /// caller never named (CWE-918). Credentials are not the exposure — reqwest
+    /// strips them cross-origin — the reachability is.
+    ///
+    /// Either way the 3xx surfaces as a status, which `extract_location_header`
+    /// reports as a `ServerError`. The spec permits a redirect on any endpoint,
+    /// but in practice registries use it for blob `GET`s handing off to storage;
+    /// on this endpoint the 202's own `Location` is the designed channel for
+    /// exactly that, so a 3xx here is redundant with it.
+    fn from_client_no_redirect(
+        client: &'a Client,
+        f: impl Fn(&reqwest::Client) -> RequestBuilder,
+    ) -> RequestBuilderWrapper<'a> {
+        let request_builder = f(&client.no_redirect_client);
         RequestBuilderWrapper {
             client,
             request_builder,
@@ -2570,6 +3043,98 @@ impl<'a> RequestBuilderWrapper<'a> {
                 .headers(headers),
         })
     }
+
+    /// Applies auth, sends, and on a `401` carrying a challenge refreshes the
+    /// token and retries **once**.
+    ///
+    /// The compensating control for a cached token that aged out between the
+    /// cache's renewal margin and what the registry actually honours: the
+    /// margin makes that window small, this makes falling into it survivable.
+    /// A second consecutive `401` is returned as it stands — an authentication
+    /// failure, not a retry loop.
+    ///
+    /// Scoped to the request builders that carry no body, which is every read
+    /// path here: the retry re-sends by cloning the builder, and a streaming
+    /// body cannot be cloned.
+    async fn send_authed(&self, image: &Reference, op: RegistryOperation) -> Result<Response> {
+        let res = self
+            .apply_auth(image, op)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        if res.status() != StatusCode::UNAUTHORIZED {
+            return Ok(res);
+        }
+        let Some(header) = res.headers().get(reqwest::header::WWW_AUTHENTICATE) else {
+            // A `401` with nothing to act on: no challenge to re-derive and no
+            // scope to re-request, so a retry would send the same request again.
+            return Ok(res);
+        };
+
+        // Drop the rejected scope's token, and only that one. A registry that
+        // has *revoked* a token commonly refuses it with a plain `Bearer`
+        // challenge and no `error` parameter, so this response cannot tell a
+        // refused scope from a dead credential — but nor is that a reason to
+        // charge every other scope under the host a fresh token exchange on
+        // the guess.
+        //
+        // The wide purge is deferred, not abandoned: the retry below is the
+        // experiment that separates the two cases, and a `401` that survives a
+        // freshly minted token escalates to `purge_registry`.
+        //
+        // So this narrows the *recovered* case only, and deliberately claims no
+        // more. A repository that is **persistently** forbidden answers the
+        // retry with a second `401` (`insufficient_scope`), the escalation
+        // fires, and every other scope under the host re-mints after all — one
+        // round-trip later than before, never more. What it buys is that a
+        // transient rejection, which is the common one, no longer charges a
+        // 512-wide fan-out for a token exchange each. Gating the escalation on
+        // the challenge's `error` parameter would close the persistent case
+        // too; that is a separate decision, not an oversight here.
+        //
+        // The cached *challenge* is dropped unconditionally and reseeded from
+        // this rejection's own header — it is a realm, not a credential, and
+        // refreshing it from the live response is what stops a cached probe
+        // suppressing a legitimate later `401`.
+        let registry = image.resolve_registry();
+        let challenge = BearerChallenge::try_from(header).ok();
+        self.client.challenges.purge(registry);
+        self.client.tokens.purge_scope(image, op).await;
+        if let Some(challenge) = challenge {
+            // The rejection carried the challenge the retry needs, so seed it
+            // rather than paying a `GET /v2/` to ask the host for it again.
+            self.client
+                .challenges
+                .seed(registry, ChallengeInfo::Bearer(challenge));
+        }
+
+        let Some(authentication) = self.client.auth_store.read().await.get(registry).cloned()
+        else {
+            // Nothing was ever stored for this registry, so the request went out
+            // anonymous and re-authenticating would change nothing.
+            return Ok(res);
+        };
+        debug!(%registry, "Re-authenticating after a 401 and retrying once");
+        self.client.auth(image, &authentication, op).await?;
+        let retried = self
+            .apply_auth(image, op)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        if retried.status() == StatusCode::UNAUTHORIZED {
+            // A token minted seconds ago was refused too, so what is dead is
+            // the credential behind every scope under this host, not the one
+            // scope that was rejected — containerd's `invalidAuthorization`.
+            // Purging now stops a sibling repository sending a token minted
+            // from the same credential until it expires.
+            //
+            // Terminal all the same: this response is returned as it stands.
+            self.client.tokens.purge_registry(registry).await;
+        }
+        Ok(retried)
+    }
 }
 
 /// The encoding of the certificate
@@ -2639,6 +3204,14 @@ pub struct ClientConfig {
     /// If set to None, an error is raised if an Image Index manifest is received
     /// during an image pull.
     pub platform_resolver: Option<Box<PlatformResolverFn>>,
+
+    /// An optional custom DNS resolver, injected into the underlying
+    /// `reqwest::Client` at build time. When set, every connection resolves host
+    /// names through it, and reqwest connects only to the addresses it returns.
+    /// This is the seam a caller uses to pin an externally-validated address at
+    /// connect time (e.g. an SSRF resolve -> validate -> pin guard). Defaults to
+    /// `None`, which keeps reqwest's built-in resolver.
+    pub dns_resolver: Option<std::sync::Arc<dyn reqwest::dns::Resolve>>,
 
     /// Maximum chunk size in bytes used to perform a `push` operation.
     ///
@@ -2727,18 +3300,28 @@ fn bundled_root_certificates() -> Vec<Certificate> {
 /// fine. Seeding the bundled roots takes the `Verifier::new_with_extra_roots`
 /// path, which never errors on an empty store and still merges the native store
 /// (`SSL_CERT_FILE` / `SSL_CERT_DIR`) on top.
-fn default_seeded_client() -> reqwest::Client {
+fn default_seeded_client(redirect: impl Fn() -> reqwest::redirect::Policy) -> reqwest::Client {
+    // A factory rather than a `Policy`, which is not `Clone`: every builder
+    // below mints its own, so the roots are the only thing that can degrade.
+    let with_policy = || reqwest::Client::builder().redirect(redirect());
     match convert_certificates(&bundled_root_certificates()) {
-        Ok(certs) => reqwest::Client::builder()
-            .tls_certs_merge(certs)
-            .build()
-            // ponytail: a seeded build cannot hit the empty-store error the roots
-            // exist to prevent; any other builder failure is genuinely exceptional,
-            // so fall back to the stock default (itself fine when a system store
-            // is present — the only case the seeded build could plausibly fail).
-            .unwrap_or_default(),
-        Err(_) => reqwest::Client::default(),
+        Ok(certs) => with_policy().tls_certs_merge(certs).build(),
+        // ponytail: the bundled roots are a compiled-in constant, so a
+        // conversion failure means there is no other set to reach for.
+        Err(_) => with_policy().build(),
     }
+    // Retry without the roots rather than falling straight through: the roots
+    // are the only input here a build can plausibly reject, and dropping them
+    // keeps the redirect policy that `unwrap_or_default` below would not.
+    .or_else(|_| with_policy().build())
+    // ponytail: this last resort IS policy-free — `reqwest::Client::default()`
+    // is a stock client that follows redirects. Nothing better exists: a
+    // `reqwest::Client` is only reachable through a builder, so a builder that
+    // refuses twice leaves this or a panic, and `Client::default()` panics
+    // anyway on the one host where a seeded build could plausibly fail (no
+    // system trust store). Named rather than claimed away — no test can reach
+    // it, because no input available here makes `build()` fail.
+    .unwrap_or_default()
 }
 
 impl Default for ClientConfig {
@@ -2752,6 +3335,7 @@ impl Default for ClientConfig {
             tls_certs_only: Vec::new(),
             extra_root_certificates: bundled_root_certificates(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
+            dns_resolver: None,
             push_chunk_size: DEFAULT_PUSH_CHUNK_SIZE,
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
             max_concurrent_download: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
@@ -2837,7 +3421,7 @@ impl ClientProtocol {
 }
 
 #[derive(Clone, Debug)]
-struct BearerChallenge {
+pub(crate) struct BearerChallenge {
     pub realm: Box<str>,
     pub service: Option<String>,
 }
@@ -3083,6 +3667,338 @@ mod test {
             .headers()["Authorization"],
             format!("Bearer {}", &token)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn scheme_downgrade_is_the_only_refused_redirect() -> anyhow::Result<()> {
+        let https = Url::parse("https://registry.example.com:8443/v2/x/blobs/uploads/1")?;
+        let plaintext = Url::parse("http://registry.example.com:8443/collect")?;
+
+        // Same host, same port, scheme dropped: reqwest keeps `Authorization`
+        // here, which is exactly why this arm exists.
+        assert!(is_scheme_downgrade(Some(&https), &plaintext));
+
+        // Everything else keeps working - CDN handoff on the pull path is a
+        // cross-host https redirect, and a plain-HTTP registry stays plain.
+        for (previous, next) in [
+            (
+                "https://registry.example.com/v2/x",
+                "https://cdn.example.net/blob",
+            ),
+            (
+                "http://registry.example.com/v2/x",
+                "http://registry.example.com/other",
+            ),
+            (
+                "http://registry.example.com/v2/x",
+                "https://registry.example.com/other",
+            ),
+        ] {
+            let previous = Url::parse(previous)?;
+            let next = Url::parse(next)?;
+            assert!(
+                !is_scheme_downgrade(Some(&previous), &next),
+                "{previous} -> {next} must still follow"
+            );
+        }
+
+        // The first hop has no predecessor to downgrade from.
+        assert!(!is_scheme_downgrade(None, &plaintext));
+
+        Ok(())
+    }
+
+    /// Every construction path yields a client carrying a redirect policy, the
+    /// degradation fallback included.
+    ///
+    /// `Client::new` warns and falls back to `Default` when `try_from` errors,
+    /// and a `ClientConfig` field a caller fills from a user-supplied string —
+    /// `https_proxy` here — is enough to reach that arm. With the policy
+    /// installed only inside `try_from`, the fallback silently restored
+    /// reqwest's default: redirects followed, and the upload path following
+    /// them off the registry (CWE-636, fail-open on error).
+    ///
+    /// Asserted through reqwest's `Debug`, which prints `redirect_policy` only
+    /// when the policy is not the default one. It is the only seam reqwest
+    /// offers short of a TLS fixture; the failure direction is safe, because a
+    /// reqwest that stopped printing the field reds this test rather than
+    /// quietly passing it.
+    #[test]
+    fn no_construction_path_yields_a_client_without_a_redirect_policy() {
+        for (label, client) in [
+            ("Default", Client::default()),
+            (
+                "try_from",
+                Client::new(ClientConfig {
+                    ..Default::default()
+                }),
+            ),
+            (
+                // `Proxy::https` rejects this, so `try_from` errors and
+                // `Client::new` takes its degradation fallback.
+                "degradation fallback",
+                Client::new(ClientConfig {
+                    https_proxy: Some("not a proxy".to_string()),
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let pull = format!("{:?}", client.client);
+            assert!(
+                pull.contains(r#"redirect_policy: "Policy(Custom)""#),
+                "{label}'s pull client lost the no-scheme-downgrade policy: {pull}"
+            );
+            let upload = format!("{:?}", client.no_redirect_client);
+            assert!(
+                upload.contains(r#"redirect_policy: "Policy(None)""#),
+                "{label}'s upload client would follow a redirect: {upload}"
+            );
+        }
+    }
+
+    /// The refusal names a target the registry chose, so it is subject to the
+    /// same disclosure rule as every other registry-supplied URL this crate
+    /// prints.
+    #[test]
+    fn a_refused_downgrade_is_redacted_before_it_is_reported() -> anyhow::Result<()> {
+        let target = Url::parse("http://user:hunter2@collector.example.net/x?token=deadbeef")?;
+        let message = scheme_downgrade_refusal(&target);
+
+        for secret in ["hunter2", "deadbeef"] {
+            assert!(
+                !message.contains(secret),
+                "the refusal published {secret}: {message}"
+            );
+        }
+        assert!(
+            message.contains("collector.example.net"),
+            "the refusal dropped the host, leaving nothing to diagnose: {message}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_auth_realm_is_refused_for_an_https_registry() -> anyhow::Result<()> {
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+
+        let https = Client::default();
+        https.require_secure_realm(&image, "https://auth.example.com/token")?;
+        for realm in [
+            "http://auth.example.com/token",
+            "http://webassembly.azurecr.io/token",
+            "not a url",
+        ] {
+            let err = https
+                .require_secure_realm(&image, realm)
+                .expect_err("an https registry must not name a plaintext realm");
+            assert!(
+                matches!(err, OciDistributionError::InsecureAuthRealm { realm: ref r } if r == realm),
+                "unexpected error for {realm}: {err:?}"
+            );
+        }
+
+        // A registry deliberately configured as plaintext may name a plaintext
+        // realm on its OWN authority - there is no credential to downgrade that
+        // the registry call itself did not already carry - and may upgrade to
+        // https at any time.
+        let plaintext = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec!["webassembly.azurecr.io".to_string()]),
+            ..Default::default()
+        });
+        plaintext.require_secure_realm(&image, "http://webassembly.azurecr.io/token")?;
+        plaintext.require_secure_realm(&image, "https://auth.example.com/token")?;
+
+        // But it is not a licence to name an ARBITRARY plaintext host. The
+        // plaintext declaration admits an on-path attacker on this registry's
+        // own traffic; that attacker answering with a realm elsewhere would
+        // walk the user's password out to the open internet, which an https
+        // realm on the same hostile registry would not have done.
+        let err = plaintext
+            .require_secure_realm(&image, "http://collector.example.com/token")
+            .expect_err("a plaintext registry must not name a foreign plaintext realm");
+        assert!(
+            matches!(err, OciDistributionError::InsecureAuthRealm { realm: ref r }
+                if r == "http://collector.example.com/token"),
+            "unexpected error: {err:?}"
+        );
+
+        // Unless that host carries its own plain-HTTP allowance - a federated
+        // token service inside the same plaintext estate stays reachable.
+        let estate = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![
+                "webassembly.azurecr.io".to_string(),
+                "auth.example.com".to_string(),
+            ]),
+            ..Default::default()
+        });
+        estate.require_secure_realm(&image, "http://auth.example.com/token")?;
+
+        // An allowance granted to a DIFFERENT host does not license a plaintext
+        // realm for this one.
+        let elsewhere = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec!["other.example.com".to_string()]),
+            ..Default::default()
+        });
+        elsewhere
+            .require_secure_realm(&image, "http://auth.example.com/token")
+            .expect_err("an unrelated plain-HTTP allowance must not redirect a credential");
+
+        Ok(())
+    }
+
+    /// The `401` retry seeds the challenge cache from the rejection's own
+    /// `WWW-Authenticate`, which is a second route by which a
+    /// registry-controlled realm reaches `_auth` — one that did not exist when
+    /// `require_secure_realm` was written, and one no probe-shaped test covers.
+    /// A seeded plaintext realm has to be refused exactly like a probed one, or
+    /// answering `401` becomes a way to launder a credential past the guard.
+    ///
+    /// The green half is `plaintext_auth_realm_is_refused_for_an_https_registry`
+    /// above: asserting it here would mean letting `_auth` reach a realm.
+    #[tokio::test]
+    async fn a_seeded_plaintext_realm_is_refused_like_a_probed_one() -> anyhow::Result<()> {
+        let client = Client::default();
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+
+        // Built the way `send_authed` builds it, from a header a hostile
+        // registry could answer with.
+        let header = HeaderValue::from_static(
+            r#"Bearer realm="http://collector.example.net/token",service="webassembly.azurecr.io""#,
+        );
+        client.challenges.seed(
+            image.resolve_registry(),
+            ChallengeInfo::Bearer(BearerChallenge::try_from(&header).expect("a bearer challenge")),
+        );
+
+        let err = client
+            ._auth(
+                &image,
+                &RegistryAuth::Basic("user".to_string(), "hunter2".to_string()),
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect_err("a seeded plaintext realm must be refused");
+        assert!(
+            matches!(
+                err,
+                OciDistributionError::InsecureAuthRealm { ref realm }
+                    if realm == "http://collector.example.net/token"
+            ),
+            "the seeded realm did not reach the guard: {err:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn session_url_off_the_registry_host_is_refused() -> anyhow::Result<()> {
+        let client = Client::default();
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+
+        client.require_same_registry(
+            &image,
+            "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        )?;
+
+        // A registry answering the upload-session POST with a foreign Location,
+        // downgrading the scheme on its own host, or naming something that is
+        // not an http(s) URL at all, gets no follow-up request - not an
+        // unauthenticated one either, since the body and the target host are
+        // registry-chosen too.
+        for url in [
+            "https://evil.example.com/v2/hello-wasm/blobs/uploads/abc",
+            "http://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+            "https://webassembly.azurecr.io:8443/v2/hello-wasm/blobs/uploads/abc",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            let err = client
+                .require_same_registry(&image, url)
+                .expect_err("cross-host session URL must be refused");
+            assert!(
+                matches!(err, OciDistributionError::CrossHostRefused { url: ref u, .. } if u == url),
+                "unexpected error for {url}: {err:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A registry declared plain HTTP that answers with an `https` session URL
+    /// on its own authority is upgrading, not handing off, so the origin check
+    /// admits it. Every other axis - host, port, and the reverse direction -
+    /// stays a mismatch.
+    #[test]
+    fn a_plaintext_registry_may_upgrade_its_own_session_url() -> anyhow::Result<()> {
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+        let plaintext = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec!["webassembly.azurecr.io".to_string()]),
+            ..Default::default()
+        });
+
+        plaintext.require_same_registry(
+            &image,
+            "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        )?;
+        plaintext.require_same_registry(
+            &image,
+            "http://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        )?;
+
+        for url in [
+            // Upgrading is not a licence to move host or port.
+            "https://evil.example.com/v2/hello-wasm/blobs/uploads/abc",
+            "https://webassembly.azurecr.io:8443/v2/hello-wasm/blobs/uploads/abc",
+        ] {
+            plaintext
+                .require_same_registry(&image, url)
+                .expect_err("the upgrade allowance must not widen host or port");
+        }
+
+        // The reverse direction is the hazard and stays refused: an https
+        // registry naming an http URL on its own host is a downgrade.
+        Client::default()
+            .require_same_registry(
+                &image,
+                "http://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+            )
+            .expect_err("a downgrade on the registry's own host must stay a mismatch");
+
+        Ok(())
+    }
+
+    /// A registry-chosen URL reaches the user's terminal - a CI job log in the
+    /// common case - so the refusal must not be the thing that publishes the
+    /// presigned signature the refusal exists to protect.
+    #[test]
+    fn a_refused_session_url_is_redacted_before_it_is_reported() -> anyhow::Result<()> {
+        let client = Client::default();
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+
+        let err = client
+            .require_same_registry(
+                &image,
+                "https://user:hunter2@bucket.s3.example/upload?X-Amz-Signature=deadbeef&partNumber=3",
+            )
+            .expect_err("a foreign session URL must be refused");
+
+        let rendered = err.to_string();
+        for secret in ["hunter2", "deadbeef"] {
+            assert!(
+                !rendered.contains(secret),
+                "the refusal published {secret}: {rendered}"
+            );
+        }
+        // Diagnosis survives redaction: the host and the parameter names stay.
+        for kept in ["bucket.s3.example", "X-Amz-Signature", "partNumber=3"] {
+            assert!(
+                rendered.contains(kept),
+                "the refusal dropped {kept}, leaving nothing to diagnose: {rendered}"
+            );
+        }
 
         Ok(())
     }
@@ -4618,264 +5534,346 @@ mod test {
             .expect_err("expected error when use_monolithic_push is true but size is None");
     }
 
-    /// Push a minimal OCI image manifest (empty config blob, no layers) to the registry and
-    /// return its digest.
-    ///
-    /// The manifest is pushed under the given `reference`.  The caller is responsible for
-    /// authenticating the client for push operations beforehand.
-    #[cfg(feature = "test-registry")]
-    async fn push_minimal_manifest(
-        client: &Client,
-        reference: &Reference,
-        artifact_type: Option<&str>,
-    ) -> String {
-        // Empty config blob.
-        let config_data = b"{}";
-        let config_digest = sha256_digest(config_data);
-        client
-            .push_blob(reference, config_data.as_slice(), &config_digest)
-            .await
-            .expect("failed to push config blob");
+    /// Manifest DELETE against an in-process registry that answers every DELETE with one canned
+    /// status and counts what reached it.
+    mod manifest_delete {
+        use std::collections::HashMap;
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
 
-        let manifest = OciImageManifest {
-            schema_version: 2,
-            media_type: Some(manifest::OCI_IMAGE_MEDIA_TYPE.to_string()),
-            artifact_type: artifact_type.map(str::to_string),
-            config: OciDescriptor {
-                media_type: manifest::IMAGE_CONFIG_MEDIA_TYPE.to_string(),
-                digest: config_digest.clone(),
-                size: config_data.len() as i64,
-                ..Default::default()
-            },
-            layers: vec![],
-            subject: None,
-            annotations: None,
-        };
+        use axum::extract::{Path, Query, State};
+        use axum::http::{header, HeaderMap, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::{any, delete, get};
+        use axum::Router;
+        use tokio::net::TcpListener;
+        use tokio::task::JoinHandle;
 
-        let oci_manifest = OciManifest::Image(manifest);
-        client
-            .push_manifest(reference, &oci_manifest)
-            .await
-            .expect("failed to push manifest")
-            // push_manifest returns the URL; extract the digest from the end
-            .rsplit('/')
-            .next()
-            .expect("manifest URL has no digest component")
-            .to_string()
-    }
+        use crate::client::{Client, ClientConfig, ClientProtocol};
+        use crate::errors::{OciDistributionError, OciErrorCode};
+        use crate::secrets::RegistryAuth;
+        use crate::token_cache::RegistryOperation;
+        use crate::Reference;
 
-    /// `distribution/distribution` does not implement the native OCI referrers API — it returns 404 for
-    /// `/v2/<name>/referrers/<digest>`.  These tests verify that `pull_referrers` correctly
-    /// falls back to the referrers tag schema in that situation.
-    ///
-    /// Referrers support is being tracked upstream by this issue: https://github.com/distribution/distribution/issues/3716
-    ///
-    /// Setup overview:
-    ///   1. Push a "target" image manifest to get its digest.
-    ///   2. Manually build and push an `OciImageIndex` as the referrers tag
-    ///      (`sha256-<target-digest>`), containing descriptor entries for two
-    ///      hypothetical referrers with different `artifact_type` values.
-    ///   3. Call `pull_referrers` and verify that the fallback is used and the
-    ///      returned index contains the expected entries (both unfiltered and filtered).
-    #[tokio::test]
-    #[cfg(feature = "test-registry")]
-    async fn test_pull_referrers_with_tag_schema_fallback() {
-        let test_container = registry_image()
-            .start()
-            .await
-            .expect("Failed to start registry container");
-        let port = test_container
-            .get_host_port_ipv4(5000)
-            .await
-            .expect("Failed to get port");
+        const DIGEST: &str =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-        let client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{port}")]),
-            ..Default::default()
-        });
+        struct Shared {
+            status: u16,
+            body: &'static str,
+            deletes: AtomicUsize,
+            elsewhere: AtomicUsize,
+            tags: Mutex<Vec<String>>,
+            scopes: Mutex<Vec<String>>,
+        }
 
-        let repo = format!("localhost:{port}/referrers-test");
+        struct Registry {
+            handle: JoinHandle<()>,
+            server: String,
+            shared: Arc<Shared>,
+        }
 
-        // --- Step 1: push the target manifest ---
-        let target_ref: Reference = format!("{repo}:target").parse().unwrap();
-        client
-            .auth(
-                &target_ref,
-                &RegistryAuth::Anonymous,
-                RegistryOperation::Push,
+        impl Drop for Registry {
+            fn drop(&mut self) {
+                self.handle.abort()
+            }
+        }
+
+        /// A bearer challenge that names this same host as the token realm, so a re-auth would be
+        /// possible if the client tried one.
+        fn challenge(headers: &HeaderMap) -> String {
+            let host = headers[header::HOST].to_str().unwrap();
+            format!("Bearer realm=\"http://{host}/token\",service=\"mock\"")
+        }
+
+        async fn ping(headers: HeaderMap) -> Response {
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, challenge(&headers))],
             )
-            .await
-            .expect("failed to authenticate for push");
-        let target_digest = push_minimal_manifest(&client, &target_ref, None).await;
+                .into_response()
+        }
 
-        // --- Step 2: push a referrers tag index ---
-        //
-        // The tag is the target digest with ':' replaced by '-'.
-        // We include two descriptors so we can also test artifact_type filtering:
-        //   - one with artifact_type "application/vnd.test.sig"
-        //   - one with artifact_type "application/vnd.test.sbom"
-        const SIG_ARTIFACT_TYPE: &str = "application/vnd.test.sig";
-        const SBOM_ARTIFACT_TYPE: &str = "application/vnd.test.sbom";
-
-        // Push two real minimal manifests to use as referrer entries.
-        let sig_ref: Reference = format!("{repo}:sig").parse().unwrap();
-        let sig_digest = push_minimal_manifest(&client, &sig_ref, Some(SIG_ARTIFACT_TYPE)).await;
-
-        let sbom_ref: Reference = format!("{repo}:sbom").parse().unwrap();
-        let sbom_digest = push_minimal_manifest(&client, &sbom_ref, Some(SBOM_ARTIFACT_TYPE)).await;
-
-        // Pull the manifests back to get the accurate serialised sizes.
-        let (sig_raw, _) = client
-            .pull_manifest_raw(
-                &sig_ref,
-                &RegistryAuth::Anonymous,
-                MIME_TYPES_DISTRIBUTION_MANIFEST,
+        async fn token(
+            State(shared): State<Arc<Shared>>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Response {
+            shared.scopes.lock().unwrap().push(query["scope"].clone());
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"token":"minted"}"#,
             )
-            .await
-            .expect("failed to pull sig manifest raw");
-        let sig_size = sig_raw.len() as i64;
+                .into_response()
+        }
 
-        let (sbom_raw, _) = client
-            .pull_manifest_raw(
-                &sbom_ref,
-                &RegistryAuth::Anonymous,
-                MIME_TYPES_DISTRIBUTION_MANIFEST,
+        async fn answer_delete(
+            State(shared): State<Arc<Shared>>,
+            Path(tag): Path<String>,
+            headers: HeaderMap,
+        ) -> Response {
+            shared.deletes.fetch_add(1, Ordering::SeqCst);
+            shared.tags.lock().unwrap().push(tag);
+            let status = StatusCode::from_u16(shared.status).unwrap();
+            let mut response = (status, shared.body).into_response();
+            if status == StatusCode::UNAUTHORIZED {
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    challenge(&headers).parse().unwrap(),
+                );
+            }
+            if status.is_redirection() {
+                response
+                    .headers_mut()
+                    .insert(header::LOCATION, "/elsewhere".parse().unwrap());
+            }
+            response
+        }
+
+        async fn elsewhere(State(shared): State<Arc<Shared>>) -> StatusCode {
+            shared.elsewhere.fetch_add(1, Ordering::SeqCst);
+            StatusCode::ACCEPTED
+        }
+
+        impl Registry {
+            async fn answering(status: u16, body: &'static str) -> Self {
+                let shared = Arc::new(Shared {
+                    status,
+                    body,
+                    deletes: AtomicUsize::new(0),
+                    elsewhere: AtomicUsize::new(0),
+                    tags: Mutex::default(),
+                    scopes: Mutex::default(),
+                });
+                let app = Router::new()
+                    .route("/v2/", get(ping))
+                    .route("/token", get(token))
+                    .route("/v2/repo/manifests/{reference}", delete(answer_delete))
+                    .route("/elsewhere", any(elsewhere))
+                    .with_state(shared.clone());
+                let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .await
+                    .unwrap();
+                let server = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+                let handle = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                Self {
+                    handle,
+                    server,
+                    shared,
+                }
+            }
+
+            fn client(&self) -> Client {
+                Client::new(ClientConfig {
+                    protocol: ClientProtocol::Http,
+                    ..Default::default()
+                })
+            }
+
+            fn tagged(&self) -> Reference {
+                format!("{}/repo:1.0", self.server).parse().unwrap()
+            }
+
+            fn deletes(&self) -> usize {
+                self.shared.deletes.load(Ordering::SeqCst)
+            }
+        }
+
+        #[tokio::test]
+        async fn a_200_or_202_answer_is_success_and_names_the_tag() {
+            for status in [200, 202] {
+                let registry = Registry::answering(status, "").await;
+                registry
+                    .client()
+                    .delete_manifest(&registry.tagged(), &RegistryAuth::Anonymous)
+                    .await
+                    .unwrap_or_else(|e| panic!("{status} must be success, got {e}"));
+                assert_eq!(registry.deletes(), 1);
+                assert_eq!(*registry.shared.tags.lock().unwrap(), ["1.0"]);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_reference_carrying_a_digest_is_refused_before_any_request() {
+            let registry = Registry::answering(202, "").await;
+            let client = registry.client();
+            let by_digest: Reference = format!("{}/repo@{DIGEST}", registry.server)
+                .parse()
+                .unwrap();
+            let tag_and_digest: Reference = format!("{}/repo:1.0@{DIGEST}", registry.server)
+                .parse()
+                .unwrap();
+
+            for reference in [by_digest, tag_and_digest] {
+                client
+                    .delete_manifest(&reference, &RegistryAuth::Anonymous)
+                    .await
+                    .expect_err("a digest delete would remove every tag sharing it");
+            }
+            assert_eq!(registry.deletes(), 0, "no request may reach the registry");
+        }
+
+        #[tokio::test]
+        async fn a_refused_delete_keeps_its_http_status_and_envelope_codes() {
+            const UNSUPPORTED: &str =
+                r#"{"errors":[{"code":"UNSUPPORTED","message":"The operation is unsupported."}]}"#;
+            const DIGEST_INVALID: &str = r#"{"errors":[{"code":"DIGEST_INVALID","message":"provided digest did not match"}]}"#;
+
+            for (status, body, code) in [
+                (405, UNSUPPORTED, OciErrorCode::Unsupported),
+                (400, UNSUPPORTED, OciErrorCode::Unsupported),
+                (400, DIGEST_INVALID, OciErrorCode::DigestInvalid),
+            ] {
+                let registry = Registry::answering(status, body).await;
+                let error = registry
+                    .client()
+                    .delete_manifest(&registry.tagged(), &RegistryAuth::Anonymous)
+                    .await
+                    .expect_err("a refused delete is an error");
+                match error {
+                    OciDistributionError::RegistryError {
+                        status: seen,
+                        envelope,
+                        ..
+                    } => {
+                        assert_eq!(seen, status);
+                        assert_eq!(envelope.errors[0].code, code);
+                    }
+                    other => panic!("{status} with an envelope must keep both, got {other:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_refused_delete_without_an_envelope_keeps_its_http_status() {
+            for status in [404, 405, 500] {
+                let registry = Registry::answering(status, "not json").await;
+                let error = registry
+                    .client()
+                    .delete_manifest(&registry.tagged(), &RegistryAuth::Anonymous)
+                    .await
+                    .expect_err("a refused delete is an error");
+                assert!(
+                    matches!(&error, OciDistributionError::ServerError { code, .. } if *code == status),
+                    "{status} without an envelope must keep its status, got {error:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_401_on_delete_is_returned_once_and_never_retried() {
+            let registry = Registry::answering(
+                401,
+                r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#,
             )
-            .await
-            .expect("failed to pull sbom manifest raw");
-        let sbom_size = sbom_raw.len() as i64;
+            .await;
+            let client = registry.client();
+            let reference = registry.tagged();
+            client
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Delete,
+                )
+                .await
+                .unwrap();
+            let exchanges = registry.shared.scopes.lock().unwrap().len();
+            assert_eq!(exchanges, 1, "the delete token is minted up front");
 
-        let referrers_index = OciImageIndex {
-            schema_version: 2,
-            media_type: Some(manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-            artifact_type: None,
-            annotations: None,
-            manifests: vec![
-                ImageIndexEntry {
-                    media_type: manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-                    digest: sig_digest,
-                    size: sig_size,
-                    artifact_type: Some(SIG_ARTIFACT_TYPE.to_string()),
-                    platform: None,
-                    annotations: None,
-                },
-                ImageIndexEntry {
-                    media_type: manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-                    digest: sbom_digest,
-                    size: sbom_size,
-                    artifact_type: Some(SBOM_ARTIFACT_TYPE.to_string()),
-                    platform: None,
-                    annotations: None,
-                },
-            ],
-        };
+            let error = client
+                .delete_manifest(&reference, &RegistryAuth::Anonymous)
+                .await
+                .expect_err("a 401 is an error");
 
-        let fallback_tag = target_digest.replace(':', "-");
-        let tag_ref: Reference = format!("{repo}:{fallback_tag}").parse().unwrap();
-        client
-            .push_manifest(&tag_ref, &OciManifest::ImageIndex(referrers_index))
-            .await
-            .expect("failed to push referrers tag index");
+            assert!(
+                matches!(error, OciDistributionError::UnauthorizedError { .. }),
+                "got {error:?}"
+            );
+            assert_eq!(
+                registry.deletes(),
+                1,
+                "the challenge on a 401 must not trigger a re-auth retry of a DELETE"
+            );
+            assert_eq!(
+                registry.shared.scopes.lock().unwrap().len(),
+                exchanges,
+                "no token exchange may follow the 401"
+            );
+        }
 
-        // --- Step 3: pull_referrers — no filter, expect both entries ---
-        let digest_ref = Reference::with_digest(
-            format!("localhost:{port}"),
-            "referrers-test".to_string(),
-            target_digest.clone(),
-        );
-        client
-            .auth(
-                &digest_ref,
-                &RegistryAuth::Anonymous,
-                RegistryOperation::Pull,
-            )
-            .await
-            .expect("failed to authenticate for pull");
+        /// A redirect is not followed, so the DELETE can never be replayed at a host the
+        /// caller did not name.
+        #[tokio::test]
+        async fn a_redirected_delete_is_not_followed() {
+            let registry = Registry::answering(307, "").await;
 
-        let index = client
-            .pull_referrers(&digest_ref, None)
-            .await
-            .expect("pull_referrers failed");
-        assert_eq!(
-            index.manifests.len(),
-            2,
-            "expected 2 referrers (unfiltered), got {:?}",
-            index.manifests
-        );
+            let error = registry
+                .client()
+                .delete_manifest(&registry.tagged(), &RegistryAuth::Anonymous)
+                .await
+                .expect_err("a redirect is an error");
 
-        // --- Step 4: pull_referrers — filtered by SIG_ARTIFACT_TYPE ---
-        let index_filtered = client
-            .pull_referrers(&digest_ref, Some(SIG_ARTIFACT_TYPE))
-            .await
-            .expect("pull_referrers with artifact_type filter failed");
-        assert_eq!(
-            index_filtered.manifests.len(),
-            1,
-            "expected 1 referrer after filtering by {SIG_ARTIFACT_TYPE}, got {:?}",
-            index_filtered.manifests
-        );
-        assert_eq!(
-            index_filtered.manifests[0].artifact_type.as_deref(),
-            Some(SIG_ARTIFACT_TYPE),
-        );
-    }
+            assert!(
+                matches!(error, OciDistributionError::ServerError { code: 307, .. }),
+                "got {error:?}"
+            );
+            assert_eq!(registry.deletes(), 1);
+            assert_eq!(
+                registry.shared.elsewhere.load(Ordering::SeqCst),
+                0,
+                "the redirect target must receive no request"
+            );
+        }
 
-    /// Verify that `pull_referrers` returns an empty index when neither the native referrers
-    /// API nor the referrers tag schema returns anything — i.e. the target image exists but
-    /// has no referrers at all.
-    #[tokio::test]
-    #[cfg(feature = "test-registry")]
-    async fn test_pull_referrers_no_tag_schema() {
-        let test_container = registry_image()
-            .start()
-            .await
-            .expect("Failed to start registry container");
-        let port = test_container
-            .get_host_port_ipv4(5000)
-            .await
-            .expect("Failed to get port");
+        #[tokio::test]
+        async fn a_delete_token_asks_for_the_delete_scope_and_is_minted_apart_from_push() {
+            let registry = Registry::answering(202, "").await;
+            let client = registry.client();
+            let reference = registry.tagged();
+            let scopes = || registry.shared.scopes.lock().unwrap().clone();
 
-        let client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{port}")]),
-            ..Default::default()
-        });
+            client
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Delete,
+                )
+                .await
+                .unwrap();
+            assert_eq!(scopes(), ["repository:repo:pull,push,delete"]);
 
-        let repo = format!("localhost:{port}/referrers-none-test");
+            client
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Delete,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                scopes().len(),
+                1,
+                "the delete token is served from the cache"
+            );
 
-        // Push a target manifest — but do NOT push any referrers tag.
-        let target_ref: Reference = format!("{repo}:target").parse().unwrap();
-        client
-            .auth(
-                &target_ref,
-                &RegistryAuth::Anonymous,
-                RegistryOperation::Push,
-            )
-            .await
-            .expect("failed to authenticate for push");
-        let target_digest = push_minimal_manifest(&client, &target_ref, None).await;
-
-        let digest_ref = Reference::with_digest(
-            format!("localhost:{port}"),
-            "referrers-none-test".to_string(),
-            target_digest,
-        );
-        client
-            .auth(
-                &digest_ref,
-                &RegistryAuth::Anonymous,
-                RegistryOperation::Pull,
-            )
-            .await
-            .expect("failed to authenticate for pull");
-
-        let index = client
-            .pull_referrers(&digest_ref, None)
-            .await
-            .expect("pull_referrers should succeed (returning empty index)");
-        assert!(
-            index.manifests.is_empty(),
-            "expected empty referrers index, got {:?}",
-            index.manifests
-        );
+            client
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Push,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                scopes(),
+                [
+                    "repository:repo:pull,push,delete",
+                    "repository:repo:pull,push"
+                ],
+                "a cached delete token must not stand in for a push token"
+            );
+        }
     }
 }

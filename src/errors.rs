@@ -13,6 +13,15 @@ pub enum OciDistributionError {
     #[error("Failed to convert Config into ConfigFile: {0}")]
     /// Transparent wrapper around `std::string::FromUtf8Error`
     ConfigConversionError(String),
+    /// A registry-controlled URL named a host other than the registry's own,
+    /// and the request that would have followed it was refused
+    #[error("Refusing to send a request to {url}: not on registry {registry}")]
+    CrossHostRefused {
+        /// The registry-supplied URL that was refused
+        url: String,
+        /// The registry the image reference resolves to
+        registry: String,
+    },
     /// An error occurred with a digest operation
     #[error("Digest error: {0}")]
     DigestError(#[from] DigestError),
@@ -31,6 +40,13 @@ pub enum OciDistributionError {
     /// Registry returned a layer with an incompatible type
     #[error("Incompatible layer media type: {0}")]
     IncompatibleLayerMediaTypeError(String),
+    /// The registry named a plaintext token-service realm while itself being
+    /// reached over HTTPS
+    #[error("Refusing to send credentials to a plaintext authentication realm: {realm}")]
+    InsecureAuthRealm {
+        /// The realm URL taken from the registry's `WWW-Authenticate` header
+        realm: String,
+    },
     /// IO Error
     #[error(transparent)]
     IoError(#[from] std::io::Error),
@@ -55,6 +71,8 @@ pub enum OciDistributionError {
     /// OCI registry error
     #[error("Registry error: url {url}, envelope: {envelope}")]
     RegistryError {
+        /// HTTP status code of the response carrying the envelope
+        status: u16,
         /// List of errors returned the by the OCI registry
         envelope: OciEnvelope,
         /// Request URL
@@ -70,8 +88,11 @@ pub enum OciDistributionError {
     #[error("Failed to decode registry token: {0}")]
     RegistryTokenDecodeError(String),
     /// Transparent wrapper around `reqwest::Error`
+    ///
+    /// The URL reqwest attached is redacted on the way in; see
+    /// [`From<reqwest::Error>`](OciDistributionError#impl-From<Error>).
     #[error(transparent)]
-    RequestError(#[from] reqwest::Error),
+    RequestError(reqwest::Error),
     /// HTTP Server error
     #[error("Server error: url {url}, code: {code}, message: {message}")]
     ServerError {
@@ -82,6 +103,18 @@ pub enum OciDistributionError {
         /// Error message returned by the remote server
         message: String,
     },
+    /// A response body exceeded the ceiling the client applies to it.
+    ///
+    /// Raised for registry-controlled responses whose length nothing in the
+    /// protocol bounds — the referrers index above all, since its size is a
+    /// function of how many artifacts the peer chooses to claim.
+    #[error("response from {url} exceeds the {limit} byte limit")]
+    ResponseTooLargeError {
+        /// Request URL
+        url: String,
+        /// The ceiling that was exceeded, in bytes
+        limit: u64,
+    },
     /// The [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md)
     /// is not respected by the remote registry
     #[error("OCI distribution spec violation: {0}")]
@@ -90,6 +123,18 @@ pub enum OciDistributionError {
     #[error("Not authorized: url {url}")]
     UnauthorizedError {
         /// request URL
+        url: String,
+    },
+    /// A manifest response arrived typed as something that cannot be a manifest.
+    ///
+    /// Read before the digest is verified: a captive portal, a proxy error page
+    /// or a mis-routed mirror answers 200 with HTML, and an unguarded client
+    /// reports that as corrupted content instead of a mis-delivered response.
+    #[error("unexpected content type '{content_type}' for a manifest response from {url}")]
+    UnexpectedContentType {
+        /// The content type the response declared
+        content_type: String,
+        /// The URL the response finally came from, after any redirects
         url: String,
     },
     /// Cannot parse URL
@@ -207,6 +252,29 @@ pub enum OciErrorCode {
     Unsupported,
     /// Too many requests from client
     Toomanyrequests,
+}
+
+impl From<reqwest::Error> for OciDistributionError {
+    /// Redacts the URL reqwest attached, before anything can print it.
+    ///
+    /// reqwest renders that URL verbatim in **both** `Display`
+    /// (`reqwest-0.13.4/src/error.rs:279-281`, `" for url ({url})"`) and
+    /// `Debug` (`:225-227`), and on a refused redirect it is `previous_url`
+    /// (`src/redirect.rs:334`) — the presigned CDN URL the registry handed out,
+    /// signature in the query. Redacting only the message this crate writes
+    /// leaves the one URL that actually carries a credential printed raw.
+    ///
+    /// Rewriting the value rather than the message is what `Error::url_mut`
+    /// exists for — its own doc names this use case — and it covers every
+    /// renderer and every consumer at once instead of one message at a time.
+    /// `is_redirect()`, `is_timeout()`, the source chain and downcasting are
+    /// untouched.
+    fn from(mut error: reqwest::Error) -> Self {
+        if let Some(url) = error.url_mut() {
+            *url = crate::client::redact_url(url);
+        }
+        Self::RequestError(error)
+    }
 }
 
 #[cfg(test)]
