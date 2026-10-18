@@ -111,6 +111,16 @@ pub struct CatalogResponse {
     pub repositories: Vec<String>,
 }
 
+/// One `_catalog` page and its raw `Link` header (RFC 8288), for callers that
+/// follow the registry's own pagination.
+#[derive(Debug)]
+pub struct CatalogPage {
+    /// Repositories on this page.
+    pub repositories: Vec<String>,
+    /// The `Link` response header, when the registry sent one.
+    pub next: Option<String>,
+}
+
 /// Layer descriptor required to pull a layer
 pub struct LayerDescriptor<'a> {
     /// The digest of the layer
@@ -2249,34 +2259,54 @@ impl Client {
         n: Option<usize>,
         last: Option<&str>,
     ) -> Result<CatalogResponse> {
+        let mut query = Vec::new();
+        if let Some(num) = n {
+            query.push(("n".to_string(), num.to_string()));
+        }
+        if let Some(l) = last {
+            query.push(("last".to_string(), l.to_string()));
+        }
+        let page = self.catalog_page(image, auth, &query).await?;
+        Ok(CatalogResponse {
+            repositories: page.repositories,
+        })
+    }
+
+    /// Fetches one `_catalog` page with the given query pairs and returns it
+    /// with the response's `Link` header, so a caller can follow registries
+    /// that paginate through an opaque cursor instead of `last`.
+    pub async fn catalog_page(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+        query: &[(String, String)],
+    ) -> Result<CatalogPage> {
         let op = RegistryOperation::Pull;
         let url = self.to_catalog_url(image);
 
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
-        let request = self.client.get(&url);
-        let request = if let Some(num) = n {
-            request.query(&[("n", num)])
-        } else {
-            request
-        };
-        let request = if let Some(l) = last {
-            request.query(&[("last", l)])
-        } else {
-            request
-        };
         let request = RequestBuilderWrapper {
             client: self,
-            request_builder: request,
+            request_builder: self.client.get(&url).query(query),
         };
         let res = request.send_authed(image, op).await?;
         let status = res.status();
+        // A registry may send `prev` and `next` as separate Link headers.
+        let links: Vec<&str> = res
+            .headers()
+            .get_all(reqwest::header::LINK)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let next = (!links.is_empty()).then(|| links.join(", "));
         let body = res.bytes().await?;
 
         validate_registry_response(status, &body, &url)?;
 
-        Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
+        let CatalogResponse { repositories } = serde_json::from_str(std::str::from_utf8(&body)?)?;
+        Ok(CatalogPage { repositories, next })
     }
 
     async fn extract_location_header(
