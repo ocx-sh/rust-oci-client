@@ -121,6 +121,18 @@ pub struct CatalogPage {
     pub next: Option<String>,
 }
 
+/// One `tags/list` page and its raw `Link` header (RFC 8288), for callers
+/// that follow the registry's own pagination.
+#[derive(Debug)]
+pub struct TagsPage {
+    /// Repository name.
+    pub name: String,
+    /// Tags on this page.
+    pub tags: Vec<String>,
+    /// The `Link` response header, when the registry sent one.
+    pub next: Option<String>,
+}
+
 /// Layer descriptor required to pull a layer
 pub struct LayerDescriptor<'a> {
     /// The digest of the layer
@@ -601,34 +613,45 @@ impl Client {
         n: Option<usize>,
         last: Option<&str>,
     ) -> Result<TagResponse> {
+        let mut query = Vec::new();
+        if let Some(num) = n {
+            query.push(("n".to_string(), num.to_string()));
+        }
+        if let Some(l) = last {
+            query.push(("last".to_string(), l.to_string()));
+        }
+        let TagsPage { name, tags, .. } = self.tags_page(image, auth, &query).await?;
+        Ok(TagResponse { name, tags })
+    }
+
+    /// Fetches one `tags/list` page with the given query pairs and returns it
+    /// with the response's `Link` header, so a caller can follow registries
+    /// that paginate tags.
+    pub async fn tags_page(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+        query: &[(String, String)],
+    ) -> Result<TagsPage> {
         let op = RegistryOperation::Pull;
         let url = self.to_list_tags_url(image);
 
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
-        let request = self.client.get(&url);
-        let request = if let Some(num) = n {
-            request.query(&[("n", num)])
-        } else {
-            request
-        };
-        let request = if let Some(l) = last {
-            request.query(&[("last", l)])
-        } else {
-            request
-        };
         let request = RequestBuilderWrapper {
             client: self,
-            request_builder: request,
+            request_builder: self.client.get(&url).query(query),
         };
         let res = request.send_authed(image, op).await?;
         let status = res.status();
+        let next = link_header(&res);
         let body = res.bytes().await?;
 
         validate_registry_response(status, &body, &url)?;
 
-        Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
+        let TagResponse { name, tags } = serde_json::from_str(std::str::from_utf8(&body)?)?;
+        Ok(TagsPage { name, tags, next })
     }
 
     /// Pull an image and return the bytes
@@ -2293,14 +2316,7 @@ impl Client {
         };
         let res = request.send_authed(image, op).await?;
         let status = res.status();
-        // A registry may send `prev` and `next` as separate Link headers.
-        let links: Vec<&str> = res
-            .headers()
-            .get_all(reqwest::header::LINK)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-        let next = (!links.is_empty()).then(|| links.join(", "));
+        let next = link_header(&res);
         let body = res.bytes().await?;
 
         validate_registry_response(status, &body, &url)?;
@@ -2587,6 +2603,18 @@ impl Client {
         }
         Ok(url.into())
     }
+}
+
+/// Every `Link` header of a response joined into one value; a registry may
+/// send `prev` and `next` as separate headers.
+fn link_header(res: &reqwest::Response) -> Option<String> {
+    let links: Vec<&str> = res
+        .headers()
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    (!links.is_empty()).then(|| links.join(", "))
 }
 
 /// Parses the inclusive end offset out of an upload-progress `Range` header.
